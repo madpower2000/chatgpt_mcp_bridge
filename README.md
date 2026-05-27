@@ -4,10 +4,14 @@ Async MCP interface for ChatGPT Web → Hermes Agent.
 
 ## Overview
 
-This plugin provides a standalone FastMCP server that exposes 8 tools for
-dispatching, monitoring, and managing Hermes Agent jobs from ChatGPT Web
-(or any MCP-compatible client), plus systemd service management for the
-standalone MCP server and Cloudflare tunnel.
+This plugin provides a standalone FastMCP server that exposes **4 public MCP tools**
+for dispatching, monitoring, and cancelling Hermes Agent jobs from ChatGPT Web
+(or any MCP-compatible client).
+
+**Service management** (bridge status, systemd install/start/stop) is available
+via **local CLI only** — it is intentionally NOT exposed over MCP for safety,
+since the MCP endpoint is reachable through Cloudflare and these tools operate
+on local systemd/cloudflared state.
 
 ## Installation
 
@@ -18,102 +22,7 @@ standalone MCP server and Cloudflare tunnel.
 hermes plugins enable chatgpt_mcp_bridge
 ```
 
-## CLI Commands
-
-Manage the bridge server and systemd services from the terminal:
-
-```bash
-# Check status (services, PID, memory, MCP endpoint)
-chatgpt_mcp_bridge status
-
-# Install systemd services (dry run first)
-chatgpt_mcp_bridge install --dry-run
-
-# Install and enable systemd services
-chatgpt_mcp_bridge install
-
-# Install with named tunnel
-chatgpt_mcp_bridge install --tunnel-mode named --named-tunnel hermes-mcp
-
-# Start bridge + tunnel
-chatgpt_mcp_bridge start
-
-# Stop tunnel then bridge
-chatgpt_mcp_bridge stop
-
-# Uninstall (stop, disable, remove unit files)
-chatgpt_mcp_bridge uninstall
-
-# Show Cloudflare tunnel URL
-chatgpt_mcp_bridge tunnel-url
-```
-
-### CLI Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--dry-run` | false | Only render unit files without writing |
-| `--tunnel-mode` | quick | `quick` or `named` |
-| `--named-tunnel` | "" | Tunnel name (required for named mode) |
-| `--host` | 127.0.0.1 | Bind address |
-| `--port` | 9100 | Port for MCP server |
-
-## Running the bridge server
-
-### Standalone MCP server
-
-```bash
-# Run as standalone server (default port 9100)
-python -m chatgpt_mcp_bridge
-
-# Custom port
-python -m chatgpt_mcp_bridge --port 9101 --host 0.0.0.0
-```
-
-### Via systemd (recommended for production)
-
-```bash
-# 1. Install services (dry run first)
-chatgpt_mcp_bridge install --dry-run
-
-# 2. Install and enable
-chatgpt_mcp_bridge install
-
-# 3. Start services
-chatgpt_mcp_bridge start
-
-# 4. Check status
-chatgpt_mcp_bridge status
-
-# 5. Stop services
-chatgpt_mcp_bridge stop
-```
-
-### Manual systemd commands
-
-```bash
-# View logs
-journalctl --user -u chatgpt-mcp-bridge.service -f
-journalctl --user -u chatgpt-mcp-cloudflared.service -f
-
-# Start/stop manually
-systemctl --user start chatgpt-mcp-bridge.service
-systemctl --user start chatgpt-mcp-cloudflared.service
-systemctl --user stop chatgpt-mcp-cloudflared.service
-systemctl --user stop chatgpt-mcp-bridge.service
-```
-
-### Quick tunnel vs Named tunnel
-
-- **Quick tunnel** (`tunnel_mode="quick"`): Cloudflare generates a random
-  URL like `https://abc123.trycloudflare.com`. Changes every restart.
-  Good for testing.
-
-- **Named tunnel** (`tunnel_mode="named"`): Uses a persistent URL like
-  `https://hermes-mcp.trycloudflare.com`. Requires `--named-tunnel NAME`.
-  Good for production use.
-
-## MCP Tools
+## Public MCP Tools (4)
 
 These tools are available via the MCP interface (from ChatGPT Web or any MCP client).
 
@@ -178,69 +87,101 @@ waits 5 seconds, then SIGKILL if still running.
 - Subprocess cancellation terminates the `hermes chat` process.
 - If the job has already completed (done/error), cancellation is rejected.
 
-### Bridge & service management tools
+## Local CLI / Admin Commands
 
-#### chatgpt_bridge_status
+Service management is available via the local CLI. These commands are NOT
+exposed over MCP — they must be run from the terminal on the host machine.
 
-Get bridge health, JobStore stats, AND systemd service status.
+```bash
+# Check status (services, PID, memory, MCP endpoint)
+python -m chatgpt_mcp_bridge cli status
 
-**Parameters:**
-- `job_id` — Optional. Empty = general bridge + service status.
+# Install systemd services (dry run first)
+python -m chatgpt_mcp_bridge cli install --dry-run
 
-**Returns:** JSON with:
-- total jobs, status counts, recent jobs
-- systemd bridge service status (active/inactive)
-- systemd tunnel service status (active/inactive)
-- local MCP URL: `http://127.0.0.1:9100/mcp`
-- helpful commands (systemctl, journalctl)
+# Install and enable systemd services
+python -m chatgpt_mcp_bridge cli install
 
-#### chatgpt_bridge_install_services
+# Install with named tunnel
+python -m chatgpt_mcp_bridge cli install --tunnel-mode named --named-tunnel hermes-mcp
 
-Install systemd user services for the bridge and Cloudflare tunnel.
+# Start bridge + tunnel
+python -m chatgpt_mcp_bridge cli start
 
-Generates two unit files in `~/.config/systemd/user/`:
-1. `chatgpt-mcp-bridge.service` — runs `python -m chatgpt_mcp_bridge`
-2. `chatgpt-mcp-cloudflared.service` — runs Cloudflare tunnel
+# Stop tunnel then bridge
+python -m chatgpt_mcp_bridge cli stop
 
-**Parameters:**
-- `mode` — Service mode (only `"user"` supported, default `"user"`)
-- `tunnel_mode` — `"quick"` or `"named"` (default `"quick"`)
-- `host` — Bind address (default `"127.0.0.1"`)
-- `port` — Port for MCP server (default `9100`)
-- `named_tunnel` — Tunnel name (required if `tunnel_mode="named"`)
-- `working_dir` — Working directory (default: home)
-- `python_path` — Path to python3 (default: auto-detect)
-- `cloudflared_path` — Path to cloudflared (default: auto-detect)
-- `dry_run` — If true, only render unit contents without writing (default `false`)
-- `enable` — If true, `systemctl --user enable` both services (default `true`)
+# Uninstall (stop, disable, remove unit files)
+python -m chatgpt_mcp_bridge cli uninstall
 
-**Returns:** JSON with `ok`, `ready`, `dry_run`, `warnings`, `errors`,
-`paths`, `daemon_reload`, `enable_results`, `bridge_unit`, `cloudflared_unit`.
+# Show Cloudflare tunnel URL
+python -m chatgpt_mcp_bridge cli tunnel-url
+```
 
-**Validation:**
-- `host` must be one of: 127.0.0.1, localhost, 0.0.0.0
-- `port` must be integer 1024-65535
-- `tunnel_mode` must be "quick" or "named"
-- `named_tunnel` required for named mode, must match `[A-Za-z0-9_.-]+`
-- `python_path` and `cloudflared_path` must be absolute paths if provided
-- `working_dir` must exist and be a directory
-- If any validation fails, `ok=false` and files are NOT written
+### CLI Options
 
-#### chatgpt_bridge_start_services
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dry-run` | false | Only render unit files without writing |
+| `--tunnel-mode` | quick | `quick` or `named` |
+| `--named-tunnel` | "" | Tunnel name (required for named mode) |
+| `--host` | 127.0.0.1 | Bind address |
+| `--port` | 9100 | Port for MCP server |
 
-Start both bridge and tunnel systemd user services.
+## Running the bridge server
 
-**Parameters:** none
+### Standalone MCP server
 
-**Returns:** JSON with start results for each service + journalctl hint.
+```bash
+# Run as standalone server (default port 9100)
+python -m chatgpt_mcp_bridge
 
-#### chatgpt_bridge_stop_services
+# Custom port
+python -m chatgpt_mcp_bridge --port 9101 --host 0.0.0.0
+```
 
-Stop tunnel first, then bridge.
+### Via systemd (recommended for production)
 
-**Parameters:** none
+```bash
+# 1. Install services (dry run first)
+python -m chatgpt_mcp_bridge cli install --dry-run
 
-**Returns:** JSON with stop results for each service.
+# 2. Install and enable
+python -m chatgpt_mcp_bridge cli install
+
+# 3. Start services
+python -m chatgpt_mcp_bridge cli start
+
+# 4. Check status
+python -m chatgpt_mcp_bridge cli status
+
+# 5. Stop services
+python -m chatgpt_mcp_bridge cli stop
+```
+
+### Manual systemd commands
+
+```bash
+# View logs
+journalctl --user -u chatgpt-mcp-bridge.service -f
+journalctl --user -u chatgpt-mcp-cloudflared.service -f
+
+# Start/stop manually
+systemctl --user start chatgpt-mcp-bridge.service
+systemctl --user start chatgpt-mcp-cloudflared.service
+systemctl --user stop chatgpt-mcp-cloudflared.service
+systemctl --user stop chatgpt-mcp-bridge.service
+```
+
+### Quick tunnel vs Named tunnel
+
+- **Quick tunnel** (`tunnel_mode="quick"`): Cloudflare generates a random
+  URL like `https://abc123.trycloudflare.com`. Changes every restart.
+  Good for testing.
+
+- **Named tunnel** (`tunnel_mode="named"`): Uses a persistent URL like
+  `https://hermes-mcp.trycloudflare.com`. Requires `--named-tunnel NAME`.
+  Good for production use.
 
 ## Architecture
 
@@ -254,10 +195,6 @@ Standalone FastMCP Server (port 9100)
     +-- chatgpt_agent_status   -> JobStore.get()
     +-- chatgpt_agent_result   -> JobStore.get()
     +-- chatgpt_agent_cancel   -> JobStore.update() + cancel event -> SIGTERM/SIGKILL
-    +-- chatgpt_bridge_status  -> JobStore.list() + systemd status
-    +-- chatgpt_bridge_install_services -> systemctl install
-    +-- chatgpt_bridge_start_services   -> systemctl start
-    +-- chatgpt_bridge_stop_services    -> systemctl stop
     |
     v
 SQLite JobStore (~/.hermes/chatgpt_mcp_bridge/jobs.sqlite)
@@ -269,6 +206,19 @@ TelegramMirror -> send_message_tool -> Telegram bot
 hermes chat subprocess (real Hermes Agent invocation)
 ```
 
+### Service management (local CLI only, NOT over MCP)
+
+```
+Local Terminal
+    |
+    +-- python -m chatgpt_mcp_bridge cli status     -> services.check_service()
+    +-- python -m chatgpt_mcp_bridge cli install     -> services.install_services()
+    +-- python -m chatgpt_mcp_bridge cli start       -> services.start_services()
+    +-- python -m chatgpt_mcp_bridge cli stop        -> services.stop_services()
+    +-- python -m chatgpt_mcp_bridge cli uninstall   -> stop + disable + remove units
+    +-- python -m chatgpt_mcp_bridge cli tunnel-url  -> journalctl grep
+```
+
 ## File structure
 
 ```
@@ -277,7 +227,7 @@ chatgpt_mcp_bridge/
     __init__.py           # register() + standalone server entry point
     __main__.py           # CLI dispatch (python -m chatgpt_mcp_bridge cli ...)
     cli.py                # CLI wrapper (status, install, start, stop, etc.)
-    tools.py              # Tool implementations (8 tools, real Hermes invocation)
+    tools.py              # Tool implementations (8 functions, 4 exposed via MCP)
     jobs.py               # SQLite JobStore
     telegram_mirror.py    # Telegram notification mirror
     services.py           # systemd service management with validation
@@ -299,11 +249,12 @@ No config.yaml changes needed. The plugin uses default paths:
 - Does NOT modify any core Hermes files (mcp_serve.py, etc.)
 - Plugin survives `hermes update` (user plugins are separate from core)
 - MCP tools appear in `hermes mcp serve` after enabling the plugin
-- CLI commands (`chatgpt_mcp_bridge status`, etc.) are independent bash tools
+- CLI commands are independent bash tools
 - JobStore is independent of SessionDB
 - Telegram mirror uses Hermes' own bot, not project-specific configs
 - Systemd services use user-level management (no sudo)
-- Quick Tunnel URL visible via: `chatgpt_mcp_bridge tunnel-url`
+- Quick Tunnel URL visible via: `python -m chatgpt_mcp_bridge cli tunnel-url`
 - Standalone server locally accessible: `curl http://127.0.0.1:9100/mcp`
 - Agent jobs run via `hermes chat` subprocess with cancellation support
 - All service management functions return Python dicts (no double-encoded JSON)
+- **Service tools are NOT exposed over MCP** — use local CLI for admin operations

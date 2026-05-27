@@ -1,10 +1,12 @@
 """
 chatgpt_mcp_bridge — Async MCP interface for ChatGPT Web → Hermes Agent.
 
-This plugin provides a standalone FastMCP server that exposes 8 tools for
-dispatching, monitoring, and managing Hermes Agent jobs from ChatGPT Web
-(or any MCP-compatible client), plus systemd service management for the
-standalone MCP server and Cloudflare tunnel.
+This plugin provides a standalone FastMCP server that exposes 4 public MCP
+tools for dispatching, monitoring, and cancelling Hermes Agent jobs from
+ChatGPT Web (or any MCP-compatible client).
+
+Service management (bridge status, systemd install/start/stop) is available
+via local CLI only — it is intentionally NOT exposed over MCP for safety.
 
 Usage:
     hermes plugins enable chatgpt_mcp_bridge
@@ -188,8 +190,9 @@ CHATGPT_BRIDGE_STOP_SERVICES_SCHEMA = {
 def register(ctx) -> None:  # noqa: D401
     """Register the chatgpt_mcp_bridge plugin.
 
-    Registers 8 MCP tools with the plugin context so they appear alongside
-    built-in tools in the agent's tool registry.
+    Registers 4 public MCP tools (agent lifecycle) with the plugin context.
+    Service/admin functions (bridge_status, install_services, start_services,
+    stop_services) remain available via local CLI but are NOT exposed over MCP.
     """
     # Import tools module with alias to avoid conflict with 'tools' parameter name
     from . import tools as bridge_tools
@@ -201,7 +204,9 @@ def register(ctx) -> None:  # noqa: D401
     bridge_tools._store = JobStore()
     bridge_tools._mirror = TelegramMirror(bridge_tools._store, default_target="telegram:528368879")
 
-    # Register each tool with the plugin context
+    # Register 4 public MCP tools (agent lifecycle only)
+    # Service/admin tools are intentionally NOT exposed over MCP for safety.
+    # They remain callable via local CLI: python -m chatgpt_mcp_bridge cli <cmd>
     ctx.register_tool(
         name="chatgpt_agent_start",
         toolset="chatgpt_mcp_bridge",
@@ -230,41 +235,12 @@ def register(ctx) -> None:  # noqa: D401
         handler=bridge_tools.chatgpt_agent_cancel,
         description="Cancel a running job.",
     )
-    ctx.register_tool(
-        name="chatgpt_bridge_status",
-        toolset="chatgpt_mcp_bridge",
-        schema=CHATGPT_BRIDGE_STATUS_SCHEMA,
-        handler=bridge_tools.chatgpt_bridge_status,
-        description="Get bridge status — general stats, job details, or systemd service status.",
-    )
-    ctx.register_tool(
-        name="chatgpt_bridge_install_services",
-        toolset="chatgpt_mcp_bridge",
-        schema=CHATGPT_BRIDGE_INSTALL_SERVICES_SCHEMA,
-        handler=bridge_tools.chatgpt_bridge_install_services,
-        description="Install systemd user services for the bridge and Cloudflare tunnel.",
-    )
-    ctx.register_tool(
-        name="chatgpt_bridge_start_services",
-        toolset="chatgpt_mcp_bridge",
-        schema=CHATGPT_BRIDGE_START_SERVICES_SCHEMA,
-        handler=bridge_tools.chatgpt_bridge_start_services,
-        description="Start both bridge and tunnel systemd user services.",
-    )
-    ctx.register_tool(
-        name="chatgpt_bridge_stop_services",
-        toolset="chatgpt_mcp_bridge",
-        schema=CHATGPT_BRIDGE_STOP_SERVICES_SCHEMA,
-        handler=bridge_tools.chatgpt_bridge_stop_services,
-        description="Stop tunnel first, then bridge systemd user services.",
-    )
 
     logger.info(
-        "chatgpt_mcp_bridge registered: 8 tools loaded "
-        "(chatgpt_agent_start, chatgpt_agent_status, chatgpt_agent_result, "
-        "chatgpt_agent_cancel, chatgpt_bridge_status, "
-        "chatgpt_bridge_install_services, chatgpt_bridge_start_services, "
-        "chatgpt_bridge_stop_services)"
+        "chatgpt_mcp_bridge registered: 4 public MCP tools "
+        "(chatgpt_agent_start, chatgpt_agent_status, "
+        "chatgpt_agent_result, chatgpt_agent_cancel). "
+        "Service/admin functions available via CLI."
     )
 
 
@@ -310,7 +286,8 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         )
         sys.exit(1)
 
-    # Create the MCP server
+    # Create the MCP server — 4 public tools only (agent lifecycle)
+    # Service/admin tools are intentionally NOT exposed over MCP for safety.
     mcp = FastMCP(
         "chatgpt-mcp-bridge",
         instructions=(
@@ -318,11 +295,8 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
             "Use chatgpt_agent_start to dispatch agent jobs, "
             "chatgpt_agent_status to poll status, "
             "chatgpt_agent_result to get results, "
-            "chatgpt_agent_cancel to stop a job, "
-            "chatgpt_bridge_status for bridge health and service status, "
-            "chatgpt_bridge_install_services to set up systemd units, "
-            "chatgpt_bridge_start_services to start them, "
-            "chatgpt_bridge_stop_services to stop them."
+            "chatgpt_agent_cancel to stop a job. "
+            "Service management is available via local CLI only."
         ),
     )
 
@@ -406,78 +380,14 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         """
         return bridge_tools.chatgpt_agent_cancel(job_id=job_id)
 
-    @mcp.tool()
-    def chatgpt_bridge_status(job_id: str = "") -> str:
-        """Get bridge status — general stats, job details, or systemd service status.
-
-        Args:
-            job_id: Optional job ID. Empty = general status.
-
-        Returns:
-            JSON with bridge stats, service statuses, and helpful commands.
-        """
-        return bridge_tools.chatgpt_bridge_status(job_id=job_id)
-
-    @mcp.tool()
-    def chatgpt_bridge_install_services(
-        mode: str = "user",
-        tunnel_mode: str = "quick",
-        host: str = "127.0.0.1",
-        port: int = 9100,
-        named_tunnel: str = "",
-        working_dir: str = "",
-        python_path: str = "",
-        cloudflared_path: str = "",
-        dry_run: bool = False,
-        enable: bool = True,
-    ) -> str:
-        """Install systemd user services for the bridge and Cloudflare tunnel.
-
-        Args:
-            mode: Service mode (only 'user').
-            tunnel_mode: 'quick' or 'named'.
-            host: Bind address.
-            port: Port.
-            named_tunnel: Tunnel name (required for named mode).
-            working_dir: Working directory.
-            python_path: Python path.
-            cloudflared_path: Cloudflared path.
-            dry_run: Only render unit files.
-            enable: Enable via systemctl.
-
-        Returns:
-            JSON with ok, unit contents, paths.
-        """
-        return bridge_tools.chatgpt_bridge_install_services(
-            mode=mode,
-            tunnel_mode=tunnel_mode,
-            host=host,
-            port=port,
-            named_tunnel=named_tunnel,
-            working_dir=working_dir,
-            python_path=python_path,
-            cloudflared_path=cloudflared_path,
-            dry_run=dry_run,
-            enable=enable,
-        )
-
-    @mcp.tool()
-    def chatgpt_bridge_start_services() -> str:
-        """Start both bridge and tunnel systemd user services.
-
-        Returns:
-            JSON with start results and journalctl hint.
-        """
-        return bridge_tools.chatgpt_bridge_start_services()
-
-    @mcp.tool()
-    def chatgpt_bridge_stop_services() -> str:
-        """Stop tunnel first, then bridge systemd user services.
-
-        Returns:
-            JSON with stop results.
-        """
-        return bridge_tools.chatgpt_bridge_stop_services()
+    # NOTE: Service/admin tools (chatgpt_bridge_status, install_services,
+    # start_services, stop_services) are intentionally NOT registered as MCP
+    # tools. They operate on local systemd/cloudflared state and are admin
+    # operations. Use the local CLI instead:
+    #   python -m chatgpt_mcp_bridge cli status
+    #   python -m chatgpt_mcp_bridge cli install
+    #   python -m chatgpt_mcp_bridge cli start
+    #   python -m chatgpt_mcp_bridge cli stop
 
     # Start the server (use StreamableHTTP transport for TCP port listening)
     logger.info("Starting chatgpt_mcp_bridge server on %s:%d", args.host, args.port)
