@@ -85,3 +85,63 @@ class BridgeStatusInput(BaseModel):
         default="",
         description="Optional job ID to get status for. Empty = general bridge status.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Service management schemas
+# ---------------------------------------------------------------------------
+
+class BridgeInstallServicesInput(BaseModel):
+    """Input for chatgpt_bridge_install_services tool."""
+    mode: str = Field(
+        default="user",
+        description="Service mode. Only 'user' is supported.",
+    )
+    tunnel_mode: str = Field(
+        default="quick",
+        description="Tunnel mode: 'quick' for anonymous tunnel, 'named' for persistent named tunnel.",
+    )
+    host: str = Field(
+        default="127.0.0.1",
+        description="Bind address for the MCP server.",
+    )
+    port: int = Field(
+        default=9100,
+        description="Port for the MCP server.",
+        ge=1,
+        le=65535,
+    )
+    named_tunnel: Optional[str] = Field(
+        default=None,
+        description="Tunnel name (required if tunnel_mode='named').",
+    )
+    working_dir: Optional[str] = Field(
+        default=None,
+        description="Working directory for services. Default: home directory.",
+    )
+    python_path: Optional[str] = Field(
+        default=None,
+        description="Path to python3. Default: auto-detect via shutil.which.",
+    )
+    cloudflared_path: Optional[str] = Field(
+        default=None,
+        description="Path to cloudflared. Default: auto-detect via shutil.which.",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="If true, only render unit files without writing or enabling.",
+    )
+    enable: bool = Field(
+        default=True,
+        description="If true, enable both services via systemctl --user enable.",
+    )
+
+
+class BridgeStartServicesInput(BaseModel):
+    """Input for chatgpt_bridge_start_services tool."""
+    pass
+
+
+class BridgeStopServicesInput(BaseModel):
+    """Input for chatgpt_bridge_stop_services tool."""
+    pass

@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 
 from .jobs import JobStore, JobRecord
 from .telegram_mirror import TelegramMirror
+from . import services as svc
 
 logger = logging.getLogger("chatgpt_mcp_bridge.tools")
 
@@ -312,13 +313,14 @@ def chatgpt_agent_cancel(job_id: str) -> str:
 # ===========================================================================
 
 def chatgpt_bridge_status(job_id: str = "") -> str:
-    """Get bridge status — either general stats or a specific job.
+    """Get bridge status — either general stats, a specific job, or systemd service status.
 
     Args:
-        job_id: Optional job ID. Empty = general bridge status.
+        job_id: Optional job ID. Empty = general bridge + service status.
 
     Returns:
-        JSON with bridge stats or job details.
+        JSON with bridge stats, JobStore info, systemd service statuses,
+        local MCP URL, and helpful commands.
     """
     _ensure()
 
@@ -343,16 +345,20 @@ def chatgpt_bridge_status(job_id: str = "") -> str:
             "telegram_target": record.telegram_target,
         }, indent=2)
 
-    # General bridge status
+    # General bridge + systemd service status
     all_jobs = _store.list_jobs(limit=1000)
     status_counts = {}
     for j in all_jobs:
         status_counts[j.status] = status_counts.get(j.status, 0) + 1
 
+    # Get systemd service info via the services module
+    service_info = svc.status_services()
+    service_data = json.loads(service_info)
+
     return json.dumps({
         "type": "bridge",
         "plugin": "chatgpt_mcp_bridge",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "total_jobs": len(all_jobs),
         "status_counts": status_counts,
         "recent_jobs": [
@@ -364,4 +370,87 @@ def chatgpt_bridge_status(job_id: str = "") -> str:
             }
             for j in all_jobs[:10]
         ],
+        "systemd_services": {
+            "bridge": service_data.get("bridge_service", {}),
+            "tunnel": service_data.get("tunnel_service", {}),
+        },
+        "local_mcp_url": service_data.get("local_mcp_url", "http://127.0.0.1:9100/mcp"),
+        "helpful_commands": service_data.get("helpful_commands", []),
     }, indent=2)
+
+
+# ===========================================================================
+# Tool: chatgpt_bridge_install_services
+# ===========================================================================
+
+def chatgpt_bridge_install_services(
+    mode: str = "user",
+    tunnel_mode: str = "quick",
+    host: str = "127.0.0.1",
+    port: int = 9100,
+    named_tunnel: str = "",
+    working_dir: str = "",
+    python_path: str = "",
+    cloudflared_path: str = "",
+    dry_run: bool = False,
+    enable: bool = True,
+) -> str:
+    """Install (or dry-run) systemd user services for the bridge.
+
+    Generates unit files for:
+      1. chatgpt-mcp-bridge.service — standalone MCP server
+      2. chatgpt-mcp-cloudflared.service — Cloudflare tunnel
+
+    Args:
+        mode: Service mode (only 'user' supported).
+        tunnel_mode: 'quick' or 'named'.
+        host: Bind address.
+        port: Port for MCP server.
+        named_tunnel: Tunnel name (required if tunnel_mode='named').
+        working_dir: Working directory.
+        python_path: Path to python3.
+        cloudflared_path: Path to cloudflared.
+        dry_run: If true, only render unit contents.
+        enable: If true, enable services via systemctl.
+
+    Returns:
+        JSON with ok, unit contents, paths, warnings.
+    """
+    return json.dumps(svc.install_services(
+        mode=mode,
+        tunnel_mode=tunnel_mode,
+        host=host,
+        port=port,
+        named_tunnel=named_tunnel if named_tunnel else None,
+        working_dir=working_dir if working_dir else None,
+        python_path=python_path if python_path else None,
+        cloudflared_path=cloudflared_path if cloudflared_path else None,
+        dry_run=dry_run,
+        enable=enable,
+    ), indent=2)
+
+
+# ===========================================================================
+# Tool: chatgpt_bridge_start_services
+# ===========================================================================
+
+def chatgpt_bridge_start_services() -> str:
+    """Start both bridge and tunnel systemd user services.
+
+    Returns:
+        JSON with start results and hint to check tunnel URL via journalctl.
+    """
+    return svc.start_services()
+
+
+# ===========================================================================
+# Tool: chatgpt_bridge_stop_services
+# ===========================================================================
+
+def chatgpt_bridge_stop_services() -> str:
+    """Stop tunnel first, then bridge systemd user services.
+
+    Returns:
+        JSON with stop results for each service.
+    """
+    return svc.stop_services()
