@@ -478,13 +478,16 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         """
         return tools.chatgpt_bridge_stop_services()
 
-    # Start the server
+    # Start the server (use StreamableHTTP transport for TCP port listening)
     logger.info("Starting chatgpt_mcp_bridge server on %s:%d", args.host, args.port)
     print(f"ChatGPT MCP Bridge server starting on {args.host}:{args.port}")
     print("Press Ctrl+C to stop.")
 
     try:
-        mcp.run_stdio_async()
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        import asyncio
+        asyncio.run(mcp.run_streamable_http_async())
     except KeyboardInterrupt:
         print("\nServer stopped.")
 
