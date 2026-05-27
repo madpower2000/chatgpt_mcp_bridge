@@ -355,6 +355,56 @@ def stop_services() -> str:
     }, indent=2)
 
 
+def _parse_service_status(service_name: str) -> Dict[str, Any]:
+    """Parse systemctl status output to extract PID, memory, etc.
+
+    Returns:
+        Dict with name, is_active, pid, memory, status_output, error.
+    """
+    result = _run_sysctl(["status", service_name, "--no-pager"])
+    stdout = result.get("stdout", "")
+    stderr = result.get("stderr", "")
+
+    is_active = "active (running)" in stdout or "active (" in stdout
+
+    pid = "N/A"
+    memory = "N/A"
+
+    if is_active:
+        # Extract PID from "Main PID: 12345 (python3)"
+        for line in stdout.splitlines():
+            if "Main PID:" in line:
+                parts = line.split("Main PID:")[1].strip().split()
+                pid = parts[0] if parts else "N/A"
+                break
+        # Extract memory from "Memory: 44.3M"
+        for line in stdout.splitlines():
+            if "Memory:" in line:
+                memory = line.split("Memory:")[1].strip().split(";")[0].strip()
+                break
+
+    return {
+        "name": service_name,
+        "is_active": is_active,
+        "pid": pid,
+        "memory": memory,
+        "status_output": stdout,
+        "error": stderr,
+    }
+
+
+def check_service(service_name: str) -> Dict[str, Any]:
+    """Check the status of a single systemd service.
+
+    Args:
+        service_name: Name of the service (e.g. 'chatgpt-mcp-bridge.service').
+
+    Returns:
+        Dict with name, is_active, pid, memory, status_output, error.
+    """
+    return _parse_service_status(service_name)
+
+
 def status_services() -> str:
     """Get status of both services and the bridge.
 
