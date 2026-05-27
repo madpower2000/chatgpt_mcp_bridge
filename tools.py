@@ -2,14 +2,14 @@
 MCP tool implementations for chatgpt_mcp_bridge.
 
 Tools:
-  chatgpt_agent_start     — dispatch agent job, return job_id immediately
-  chatgpt_agent_status    — poll queued/running/done/error/cancelled
-  chatgpt_agent_result    — get response/error for a completed job
-  chatgpt_agent_cancel    — interrupt a running job
-  chatgpt_bridge_status   — bridge health + JobStore stats + systemd status
-  chatgpt_bridge_install_services — install systemd user services
-  chatgpt_bridge_start_services       — start bridge + tunnel services
-  chatgpt_bridge_stop_services        — stop tunnel then bridge services
+  chatgpt_agent_start               — dispatch agent job, return job_id immediately
+  chatgpt_agent_status              — poll queued/running/done/error/cancelled
+  chatgpt_agent_result              — get response/error for a completed job
+  chatgpt_agent_cancel              — interrupt a running job
+  chatgpt_bridge_status             — bridge health + JobStore stats + systemd status
+  chatgpt_bridge_install_services   — install systemd user services
+  chatgpt_bridge_start_services     — start bridge + tunnel services
+  chatgpt_bridge_stop_services      — stop tunnel then bridge services
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ _mirror = None  # TelegramMirror
 # In-memory cancel events: job_id -> threading.Event
 _cancel_events: dict[str, threading.Event] = {}
 
+
 # ---------------------------------------------------------------------------
 # Real Hermes Agent invocation (subprocess fallback)
 # ---------------------------------------------------------------------------
@@ -40,7 +41,10 @@ _cancel_events: dict[str, threading.Event] = {}
 def run_hermes_agent_job(record, cancel_event: threading.Event | None = None) -> dict:
     """Run a Hermes Agent job via subprocess fallback.
 
-    Invokes ``hermes chat -q <prompt>`` with optional model and toolsets.
+    Invokes ``hermes chat -q <final_prompt>`` with optional model, toolsets,
+    max-turns, and --ignore-rules (to prevent auto-injection of AGENTS.md/SOUL.md/
+    memory when custom system_prompt or rules are provided).
+
     Returns a dict with keys: response, error, iterations, session_id.
 
     Args:
@@ -59,36 +63,49 @@ def run_hermes_agent_job(record, cancel_event: threading.Event | None = None) ->
             "session_id": "",
         }
 
-    cmd = [hermes_bin, "chat", "-q", record.prompt, "--quiet"]
+    # Build final_prompt WITHOUT mutating record.prompt (Fix 2)
+    # Order: system_prompt override first, then context, then rules, then the original prompt
+    final_prompt = record.prompt
+
+    if record.system_prompt:
+        final_prompt = f"[System: {record.system_prompt}]\n\n{final_prompt}"
+
+    if record.context:
+        final_prompt = f"[Context: {record.context}]\n\n{final_prompt}"
+
+    if record.rules:
+        final_prompt = f"{final_prompt}\n\nAdditional rules:\n{record.rules}"
+
+    # Build cmd — confirmed CLI flags from `hermes chat --help`:
+    #   -q QUERY     (required)
+    #   -m MODEL     (optional)
+    #   -t TOOLSETS  (comma-separated)
+    #   -s SKILLS    (comma-separated, for context/roles)
+    #   --max-turns N (optional, default 90)
+    #   -Q           (quiet mode)
+    #   --ignore-rules (skip AGENTS.md/SOUL.md/memory when custom rules/system_prompt used)
+    cmd = [hermes_bin, "chat", "-q", final_prompt, "-Q"]
 
     if record.model:
         cmd.extend(["-m", record.model])
 
-    # tools parameter is a JSON array string like '["web","terminal"]'
+    # tools parameter is a JSON array string like '["web","terminal"]' (Fix 5: robust parsing)
     if record.tools and record.tools.strip() != "[]":
         try:
             tool_list = json.loads(record.tools)
-            if tool_list:
+            if isinstance(tool_list, list) and tool_list:
                 cmd.extend(["-t", ",".join(tool_list)])
-        except json.JSONDecodeError:
-            # If parsing fails, ignore — run with all toolsets
+        except (json.JSONDecodeError, TypeError):
+            # Invalid JSON — skip tools, run with defaults (Fix 5)
             pass
 
     if record.max_iterations > 0:
         cmd.extend(["--max-turns", str(record.max_iterations)])
 
-    if record.context:
-        cmd.extend(["-s", record.context])
-
-    if record.rules:
-        # Rules are injected into context via --pass-session-id style;
-        # we append them to the prompt for simplicity.
-        record.prompt = record.prompt + "\n\nAdditional rules:\n" + record.rules
-
-    if record.system_prompt:
-        # System prompt override is not directly supported via CLI flags,
-        # so we embed it in the prompt.
-        record.prompt = "[System: " + record.system_prompt + "]\n\n" + record.prompt
+    # If custom system_prompt or rules are provided, skip auto-injection of
+    # AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills
+    if record.system_prompt or record.rules:
+        cmd.append("--ignore-rules")
 
     logger.info("Running hermes agent: %s", " ".join(cmd[:5]) + "...")
 
@@ -141,7 +158,6 @@ def run_hermes_agent_job(record, cancel_event: threading.Event | None = None) ->
             }
 
         # Extract response: hermes --quiet outputs the response first, then session info
-        # Response is everything before the first blank line followed by session_id
         lines = stdout.strip().splitlines()
         response_lines = []
         for line in lines:
@@ -197,11 +213,21 @@ def chatgpt_agent_start(
         return json.dumps({"error": "JobStore not initialized. Call register() first."})
 
     # 1. Create job record (status=queued)
+    # Parse tools JSON robustly (Fix 5: protect create_job from invalid JSON too)
+    parsed_tools = []
+    if tools and tools.strip() != "[]":
+        try:
+            parsed_tools = json.loads(tools)
+            if not isinstance(parsed_tools, list):
+                parsed_tools = []
+        except (json.JSONDecodeError, TypeError):
+            parsed_tools = []
+
     record = _store.create_job(
         prompt=prompt,
         model=model,
         max_iterations=max_iterations,
-        tools=json.loads(tools) if tools and tools.strip() != "[]" else [],
+        tools=parsed_tools,
         context=context,
         rules=rules,
         system_prompt=system_prompt,
@@ -212,7 +238,7 @@ def chatgpt_agent_start(
 
     # 2. Send Telegram start notification ONCE here (not in background thread)
     if mirror_to_telegram and _mirror is not None:
-        tg_target = telegram_target or ''
+        tg_target = telegram_target or ""
         _mirror.notify_start(job_id, prompt, tg_target)
 
     # 3. Create cancel event and store it
@@ -240,7 +266,11 @@ def chatgpt_agent_start(
 # ---------------------------------------------------------------------------
 
 def _start_background_job(record, cancel_event: threading.Event) -> None:
-    """Background thread: set status=running, run agent, set status=done/error/cancelled."""
+    """Background thread: set status=running, run agent, set status=done/error/cancelled.
+
+    All Telegram mirror calls are wrapped in try/except (Fix 6) so that
+    notification failures never break job execution.
+    """
     if _store is None:
         return
 
@@ -252,7 +282,10 @@ def _start_background_job(record, cancel_event: threading.Event) -> None:
         if cancel_event.is_set():
             _store.update_job(job_id, status="cancelled", completed_at=time.time())
             if _mirror is not None:
-                _mirror.notify_cancelled(job_id)
+                try:
+                    _mirror.notify_cancelled(job_id)
+                except Exception:
+                    logger.exception("Telegram notify_cancelled failed for %s", job_id)
             return
 
         # Set to running
@@ -271,10 +304,13 @@ def _start_background_job(record, cancel_event: threading.Event) -> None:
                 session_id=result.get("session_id", ""),
             )
             if _mirror is not None:
-                _mirror.notify_cancelled(job_id)
+                try:
+                    _mirror.notify_cancelled(job_id)
+                except Exception:
+                    logger.exception("Telegram notify_cancelled failed for %s", job_id)
             return
 
-        # Success
+        # Success or error
         if result["error"]:
             _store.update_job(
                 job_id,
@@ -286,8 +322,11 @@ def _start_background_job(record, cancel_event: threading.Event) -> None:
                 completed_at=time.time(),
             )
             if _mirror is not None:
-                tg_target = record.telegram_target or ''
-                _mirror.notify_error(job_id, result["error"], tg_target)
+                try:
+                    tg_target = record.telegram_target or ""
+                    _mirror.notify_error(job_id, result["error"], tg_target)
+                except Exception:
+                    logger.exception("Telegram notify_error failed for %s", job_id)
         else:
             _store.update_job(
                 job_id,
@@ -299,15 +338,24 @@ def _start_background_job(record, cancel_event: threading.Event) -> None:
                 completed_at=time.time(),
             )
             if _mirror is not None:
-                tg_target = record.telegram_target or ''
-                _mirror.notify_complete(job_id, result["response"], tg_target)
+                try:
+                    tg_target = record.telegram_target or ""
+                    _mirror.notify_complete(job_id, result["response"], tg_target)
+                except Exception:
+                    logger.exception("Telegram notify_complete failed for %s", job_id)
 
     except Exception as exc:
         logger.exception("Background job %s failed: %s", job_id, exc)
         _store.update_job(job_id, status="error", error=str(exc), completed_at=time.time())
         if _mirror is not None:
-            tg_target = record.telegram_target or ''
-            _mirror.notify_error(job_id, str(exc), tg_target)
+            try:
+                tg_target = record.telegram_target or ""
+                _mirror.notify_error(job_id, str(exc), tg_target)
+            except Exception:
+                logger.exception("Telegram notify_error failed for %s", job_id)
+    finally:
+        # Cleanup cancel event reference (Fix 7: don't delete in cancel(), clean up here)
+        _cancel_events.pop(job_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +421,9 @@ def chatgpt_agent_cancel(job_id: str) -> str:
 
     For subprocess-based backend, the process is terminated with
     SIGTERM followed by SIGKILL after a grace period.
+
+    Fix 7: Does NOT delete the cancel event — cleanup happens in
+    _start_background_job's finally block.
     """
     if _store is None:
         return json.dumps({"error": "JobStore not initialized"})
@@ -389,12 +440,10 @@ def chatgpt_agent_cancel(job_id: str) -> str:
             "reason": f"Job is already {record.status}, cannot cancel",
         })
 
-    # Signal cancellation
+    # Signal cancellation — do NOT delete the event (Fix 7)
     cancel_evt = _cancel_events.get(job_id)
     if cancel_evt:
         cancel_evt.set()
-        # Remove from tracking
-        del _cancel_events[job_id]
 
     # Update status
     _store.update_job(job_id, status="cancelled", completed_at=time.time())

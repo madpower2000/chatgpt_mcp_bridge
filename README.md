@@ -4,7 +4,7 @@ Async MCP interface for ChatGPT Web → Hermes Agent.
 
 ## Overview
 
-This plugin provides a standalone FastMCP server that exposes 9 tools for
+This plugin provides a standalone FastMCP server that exposes 8 tools for
 dispatching, monitoring, and managing Hermes Agent jobs from ChatGPT Web
 (or any MCP-compatible client), plus systemd service management for the
 standalone MCP server and Cloudflare tunnel.
@@ -277,7 +277,7 @@ chatgpt_mcp_bridge/
     __init__.py           # register() + standalone server entry point
     __main__.py           # CLI dispatch (python -m chatgpt_mcp_bridge cli ...)
     cli.py                # CLI wrapper (status, install, start, stop, etc.)
-    tools.py              # Tool implementations (9 tools, real Hermes invocation)
+    tools.py              # Tool implementations (8 tools, real Hermes invocation)
     jobs.py               # SQLite JobStore
     telegram_mirror.py    # Telegram notification mirror
     services.py           # systemd service management with validation

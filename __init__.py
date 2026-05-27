@@ -1,7 +1,7 @@
 """
 chatgpt_mcp_bridge — Async MCP interface for ChatGPT Web → Hermes Agent.
 
-This plugin provides a standalone FastMCP server that exposes 9 tools for
+This plugin provides a standalone FastMCP server that exposes 8 tools for
 dispatching, monitoring, and managing Hermes Agent jobs from ChatGPT Web
 (or any MCP-compatible client), plus systemd service management for the
 standalone MCP server and Cloudflare tunnel.
@@ -188,7 +188,7 @@ CHATGPT_BRIDGE_STOP_SERVICES_SCHEMA = {
 def register(ctx) -> None:  # noqa: D401
     """Register the chatgpt_mcp_bridge plugin.
 
-    Registers 9 MCP tools with the plugin context so they appear alongside
+    Registers 8 MCP tools with the plugin context so they appear alongside
     built-in tools in the agent's tool registry.
     """
     # Import tools module with alias to avoid conflict with 'tools' parameter name
@@ -260,7 +260,7 @@ def register(ctx) -> None:  # noqa: D401
     )
 
     logger.info(
-        "chatgpt_mcp_bridge registered: 9 tools loaded "
+        "chatgpt_mcp_bridge registered: 8 tools loaded "
         "(chatgpt_agent_start, chatgpt_agent_status, chatgpt_agent_result, "
         "chatgpt_agent_cancel, chatgpt_bridge_status, "
         "chatgpt_bridge_install_services, chatgpt_bridge_start_services, "

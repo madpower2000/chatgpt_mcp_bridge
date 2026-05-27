@@ -1,6 +1,5 @@
 name: chatgpt_mcp_bridge
-version: 0.3.0
-description: "Async MCP interface for ChatGPT Web → Hermes Agent. Provides 9 tools for agent job dispatch, monitoring, cancellation, and systemd service management."
-kind: backend
-entrypoint: "chatgpt_mcp_bridge:register"
+version: 0.3.1
+description: "Async MCP interface for ChatGPT Web → Hermes Agent. Provides 8 tools for agent job dispatch, monitoring, cancellation, and systemd service management."
+author: madpower2000
 enabled: true

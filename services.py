@@ -224,9 +224,9 @@ def _render_cloudflared_unit(config: dict) -> str:
     named = config["named_tunnel"]
 
     if tunnel_mode == "quick":
-        tunnel_arg = "quick-tunnel"
-    else:
         tunnel_arg = f"tunnel --url http://{host}:{port}"
+    else:
+        tunnel_arg = f"tunnel run {named}"
 
     return (
         f"[Unit]\n"
@@ -341,37 +341,46 @@ def install_services(
         return result
 
     # Daemon reload
+    daemon_ok = False
     try:
         subprocess.run(
             ["systemctl", "--user", "daemon-reload"],
             capture_output=True, text=True, timeout=10,
         )
+        daemon_ok = True
         result["daemon_reload"] = True
     except Exception as exc:
         errors.append(f"daemon-reload failed: {exc}")
+        result["daemon_reload"] = False
 
     # Enable services
+    enable_ok = True
     for svc_name in ["chatgpt-mcp-bridge.service", "chatgpt-mcp-cloudflared.service"]:
         try:
             out = subprocess.run(
                 ["systemctl", "--user", "enable", svc_name],
                 capture_output=True, text=True, timeout=10,
             )
+            ok = out.returncode == 0
+            if not ok:
+                enable_ok = False
+                errors.append(f"enable {svc_name} failed: {out.stderr.strip()}")
             result["enable_results"].append({
                 "service": svc_name,
-                "success": out.returncode == 0,
+                "success": ok,
                 "error": out.stderr.strip() if out.returncode != 0 else "",
             })
         except Exception as exc:
+            enable_ok = False
+            errors.append(f"enable {svc_name} failed: {exc}")
             result["enable_results"].append({
                 "service": svc_name,
                 "success": False,
                 "error": str(exc),
             })
 
-    # Overall ok = all enables succeeded
-    all_enabled = all(r["success"] for r in result["enable_results"])
-    result["ok"] = all_enabled and not errors
+    # Overall ok = daemon reload succeeded AND all enables succeeded AND no errors
+    result["ok"] = daemon_ok and enable_ok and not errors
     result["ready"] = True
 
     return result
