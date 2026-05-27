@@ -1,17 +1,33 @@
-"""Entry point for: python -m chatgpt_mcp_bridge"""
+"""
+Entry point for chatgpt_mcp_bridge.
+
+Usage:
+    python -m chatgpt_mcp_bridge              # Start standalone MCP server
+    python -m chatgpt_mcp_bridge --port 9101  # Custom port
+    python -m chatgpt_mcp_bridge cli status   # CLI commands
+"""
+
 import sys
-import os
 
-# Ensure plugins dir is in path
-plugins_dir = os.path.join(os.path.expanduser("~"), ".hermes", "plugins")
-if plugins_dir not in sys.path:
-    sys.path.insert(0, plugins_dir)
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("Usage:")
+        print("  python -m chatgpt_mcp_bridge              Start MCP server")
+        print("  python -m chatgpt_mcp_bridge --port PORT  Start on custom port")
+        print("  python -m chatgpt_mcp_bridge cli <cmd>    CLI commands")
+        print()
+        print("CLI commands: status, install, start, stop, uninstall, tunnel-url")
+        print()
+        print("For CLI help, run: python -m chatgpt_mcp_bridge cli --help")
+        sys.exit(0)
 
-if "cli" in sys.argv[1:]:
-    # Remove 'cli' from args and dispatch
-    sys.argv = ["chatgpt_mcp_bridge"] + [a for a in sys.argv[1:] if a != "cli"]
-    from chatgpt_mcp_bridge.cli import main
+    # If first arg is 'cli', dispatch to CLI
+    if len(sys.argv) > 1 and sys.argv[1] == "cli":
+        from .cli import main as cli_main
+        cli_main()
+    else:
+        from . import run_server
+        run_server()
+
+if __name__ == "__main__":
     main()
-else:
-    from chatgpt_mcp_bridge import run_server
-    run_server()

@@ -134,11 +134,16 @@ def send_telegram_message(target: str, message: str) -> dict:
 
 
 class TelegramMirror:
-    """Manages Telegram notification for a single job."""
+    """Manages Telegram notifications for ChatGPT → Hermes Agent bridge.
 
-    def __init__(self, store):
+    Sends start, complete, error, and cancelled notifications to Telegram.
+    Uses the send_message_tool path identical to how mcp_serve.py does it.
+    """
+
+    def __init__(self, store, default_target: str = ""):
         self._store = store
         self._sent = threading.local()  # track sent states per thread
+        self.default_target = default_target
 
     def notify_start(self, job_id: str, prompt: str, telegram_target: str):
         """Send start notification."""
@@ -165,6 +170,16 @@ class TelegramMirror:
         target = _resolve_target(telegram_target)
         message = f"Hermes error: {_truncate(error, 300)}"
         self._send(target, message, job_id, "error")
+
+    def notify_cancelled(self, job_id: str):
+        """Send cancellation notification."""
+        record = self._store.get_job(job_id) if self._store else None
+        tg_target = record.telegram_target if record else None
+        if not tg_target:
+            return
+        target = _resolve_target(tg_target)
+        message = f"ChatGPT → Hermes: cancelled"
+        self._send(target, message, job_id, "cancelled")
 
     def _send(self, target: str, message: str, job_id: str, kind: str):
         """Send a single message with dedup protection."""

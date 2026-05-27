@@ -93,9 +93,10 @@ def cmd_install(args):
         enable=not args.dry_run,
     )
 
-    data = json.loads(result)
+    data = result if isinstance(result, dict) else json.loads(result)
     if not data["ok"]:
-        print(f"ERROR: {data.get('error', 'unknown')}", file=sys.stderr)
+        for err in data.get("errors", ["unknown"]):
+            print(f"ERROR: {err}", file=sys.stderr)
         sys.exit(1)
 
     if data.get("dry_run"):
@@ -135,7 +136,7 @@ def cmd_start(args):
     from chatgpt_mcp_bridge import services
 
     result = services.start_services()
-    data = json.loads(result)
+    data = result if isinstance(result, dict) else json.loads(result)
 
     for svc, info in data.items():
         if svc == "hint":
@@ -155,7 +156,7 @@ def cmd_stop(args):
     from chatgpt_mcp_bridge import services
 
     result = services.stop_services()
-    data = json.loads(result)
+    data = result if isinstance(result, dict) else json.loads(result)
 
     for svc, info in data.items():
         if svc == "hint":
@@ -172,7 +173,7 @@ def cmd_uninstall(args):
 
     # Stop services first
     stop_result = services.stop_services()
-    stop_data = json.loads(stop_result)
+    stop_data = stop_result if isinstance(stop_result, dict) else json.loads(stop_result)
 
     # Disable
     for svc in ["chatgpt-mcp-cloudflared.service", "chatgpt-mcp-bridge.service"]:

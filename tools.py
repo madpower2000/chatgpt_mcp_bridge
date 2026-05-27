@@ -1,45 +1,183 @@
 """
 MCP tool implementations for chatgpt_mcp_bridge.
 
-Each tool is a plain function that operates on the shared JobStore.
-They are registered with FastMCP via the plugin's register() function.
+Tools:
+  chatgpt_agent_start     — dispatch agent job, return job_id immediately
+  chatgpt_agent_status    — poll queued/running/done/error/cancelled
+  chatgpt_agent_result    — get response/error for a completed job
+  chatgpt_agent_cancel    — interrupt a running job
+  chatgpt_bridge_status   — bridge health + JobStore stats + systemd status
+  chatgpt_bridge_install_services — install systemd user services
+  chatgpt_bridge_start_services       — start bridge + tunnel services
+  chatgpt_bridge_stop_services        — stop tunnel then bridge services
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import subprocess
 import threading
 import time
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Optional
 
-from .jobs import JobStore, JobRecord
-from .telegram_mirror import TelegramMirror
-from . import services as svc
+logger = logging.getLogger("chatgpt_mcp_bridge")
 
-logger = logging.getLogger("chatgpt_mcp_bridge.tools")
+# Shared state — populated by __init__.py register()
+_store = None  # JobStore
+_mirror = None  # TelegramMirror
+
+# In-memory cancel events: job_id -> threading.Event
+_cancel_events: dict[str, threading.Event] = {}
 
 # ---------------------------------------------------------------------------
-# Shared state — set by register()
+# Real Hermes Agent invocation (subprocess fallback)
 # ---------------------------------------------------------------------------
 
-_store: Optional[JobStore] = None
-_mirror: Optional[TelegramMirror] = None
-_cancel_tokens: Dict[str, threading.Event] = {}  # job_id -> cancel event
-_lock = threading.Lock()
+def run_hermes_agent_job(record, cancel_event: threading.Event | None = None) -> dict:
+    """Run a Hermes Agent job via subprocess fallback.
+
+    Invokes ``hermes chat -q <prompt>`` with optional model and toolsets.
+    Returns a dict with keys: response, error, iterations, session_id.
+
+    Args:
+        record: JobRecord with all job parameters.
+        cancel_event: If set, the subprocess will be terminated when signaled.
+
+    Returns:
+        {"response": str, "error": str, "iterations": int, "session_id": str}
+    """
+    hermes_bin = shutil.which("hermes")
+    if not hermes_bin:
+        return {
+            "response": "",
+            "error": "hermes binary not found in PATH",
+            "iterations": 0,
+            "session_id": "",
+        }
+
+    cmd = [hermes_bin, "chat", "-q", record.prompt, "--quiet"]
+
+    if record.model:
+        cmd.extend(["-m", record.model])
+
+    # tools parameter is a JSON array string like '["web","terminal"]'
+    if record.tools and record.tools.strip() != "[]":
+        try:
+            tool_list = json.loads(record.tools)
+            if tool_list:
+                cmd.extend(["-t", ",".join(tool_list)])
+        except json.JSONDecodeError:
+            # If parsing fails, ignore — run with all toolsets
+            pass
+
+    if record.max_iterations > 0:
+        cmd.extend(["--max-turns", str(record.max_iterations)])
+
+    if record.context:
+        cmd.extend(["-s", record.context])
+
+    if record.rules:
+        # Rules are injected into context via --pass-session-id style;
+        # we append them to the prompt for simplicity.
+        record.prompt = record.prompt + "\n\nAdditional rules:\n" + record.rules
+
+    if record.system_prompt:
+        # System prompt override is not directly supported via CLI flags,
+        # so we embed it in the prompt.
+        record.prompt = "[System: " + record.system_prompt + "]\n\n" + record.prompt
+
+    logger.info("Running hermes agent: %s", " ".join(cmd[:5]) + "...")
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Wait with cancel support
+        while True:
+            if cancel_event and cancel_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return {
+                    "response": "",
+                    "error": "Job was cancelled by user",
+                    "iterations": 0,
+                    "session_id": record.session_id or "",
+                }
+
+            ret = proc.poll()
+            if ret is not None:
+                break
+            time.sleep(0.5)
+
+        stdout = proc.stdout.read() if proc.stdout else ""
+        stderr = proc.stderr.read() if proc.stderr else ""
+
+        # Parse session_id from stderr (hermes outputs it at the end)
+        session_id = record.session_id or ""
+        for line in stderr.splitlines():
+            if line.startswith("session_id:"):
+                session_id = line.split(":", 1)[1].strip()
+                break
+
+        if proc.returncode != 0:
+            return {
+                "response": "",
+                "error": stderr.strip() or f"hermes exited with code {proc.returncode}",
+                "iterations": 0,
+                "session_id": session_id,
+            }
+
+        # Extract response: hermes --quiet outputs the response first, then session info
+        # Response is everything before the first blank line followed by session_id
+        lines = stdout.strip().splitlines()
+        response_lines = []
+        for line in lines:
+            if line.startswith("session_id:"):
+                break
+            response_lines.append(line)
+        response = "\n".join(response_lines).strip()
+
+        return {
+            "response": response,
+            "error": "",
+            "iterations": 1,  # Single-query mode = 1 iteration
+            "session_id": session_id,
+        }
+
+    except subprocess.TimeoutExpired:
+        if proc:
+            proc.kill()
+        return {
+            "response": "",
+            "error": "Job timed out after 600 seconds",
+            "iterations": 0,
+            "session_id": record.session_id or "",
+        }
+    except Exception as exc:
+        return {
+            "response": "",
+            "error": str(exc),
+            "iterations": 0,
+            "session_id": record.session_id or "",
+        }
 
 
-def _ensure():
-    global _store, _mirror
-    if _store is None:
-        _store = JobStore()
-    if _mirror is None:
-        _mirror = TelegramMirror(_store)
-
-
-# ===========================================================================
-# Tool: chatgpt_agent_start
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# chatgpt_agent_start
+# ---------------------------------------------------------------------------
 
 def chatgpt_agent_start(
     prompt: str,
@@ -52,336 +190,276 @@ def chatgpt_agent_start(
     mirror_to_telegram: bool = False,
     telegram_target: str = "",
 ) -> str:
-    """Start a new ChatGPT → Hermes Agent job.
+    """Start a new agent job. Creates a record, sends Telegram start (if requested),
+    launches background thread, and returns job_id immediately."""
 
-    Creates a job in the persistent store and returns the job_id immediately.
-    The actual agent runtime is launched asynchronously in a background task.
+    if _store is None:
+        return json.dumps({"error": "JobStore not initialized. Call register() first."})
 
-    Args:
-        prompt: The user prompt to send to Hermes Agent.
-        model: Model to use (empty = default).
-        max_iterations: Max tool-use iterations.
-        tools: JSON array of tool names to enable.
-        context: Additional context for the agent.
-        rules: Additional rules/instructions.
-        system_prompt: Override system prompt.
-        mirror_to_telegram: Whether to mirror to Telegram.
-        telegram_target: Telegram target (e.g. 'telegram:528368879').
-
-    Returns:
-        JSON with job_id, status, and timestamps.
-    """
-    _ensure()
-
-    # Parse tools list
-    try:
-        tools_list = json.loads(tools) if tools else []
-        if not isinstance(tools_list, list):
-            tools_list = []
-    except (json.JSONDecodeError, TypeError):
-        tools_list = []
-
-    # Create the job record
+    # 1. Create job record (status=queued)
     record = _store.create_job(
         prompt=prompt,
         model=model,
         max_iterations=max_iterations,
-        tools=tools_list,
+        tools=json.loads(tools) if tools and tools.strip() != "[]" else [],
         context=context,
         rules=rules,
         system_prompt=system_prompt,
         telegram_target=telegram_target,
         mirror_to_telegram=mirror_to_telegram,
     )
+    job_id = record.job_id
 
-    # Send Telegram start notification
-    if mirror_to_telegram and telegram_target:
-        try:
-            _mirror.notify_start(record.job_id, prompt, telegram_target)
-        except Exception as e:
-            logger.warning("Telegram start notification failed: %s", e)
+    # 2. Send Telegram start notification ONCE here (not in background thread)
+    if mirror_to_telegram and _mirror is not None:
+        tg_target = telegram_target or ''
+        _mirror.notify_start(job_id, prompt, tg_target)
 
-    # Register cancel token
-    with _lock:
-        _cancel_tokens[record.job_id] = threading.Event()
+    # 3. Create cancel event and store it
+    cancel_evt = threading.Event()
+    _cancel_events[job_id] = cancel_evt
 
-    # Launch background runtime (placeholder — actual implementation hooks
-    # into the Hermes agent lifecycle via the plugin context).
-    _start_background_job(record)
-
-    return json.dumps({
-        "job_id": record.job_id,
-        "status": record.status,
-        "model": record.model,
-        "created_at": record.created_at,
-        "mirror_to_telegram": record.mirror_to_telegram,
-        "telegram_target": record.telegram_target,
-    }, indent=2)
-
-
-def _start_background_job(record: JobRecord):
-    """Launch the agent runtime in a background thread.
-
-    This is the bridge point where ChatGPT Web's async request connects
-    to the Hermes Agent lifecycle. The actual implementation depends on
-    how the plugin context exposes the agent runtime.
-    """
-    def _run():
-        try:
-            # Update status to running
-            _store.update_job(record.job_id, status="running", started_at=time.time())
-
-            if _mirror:
-                try:
-                    _mirror.notify_start(record.job_id, record.prompt, record.telegram_target)
-                except Exception:
-                    pass
-
-            # --- Placeholder: actual agent invocation ---
-            # In the real implementation, this is where we:
-            # 1. Load the agent with the specified model/tools/context
-            # 2. Run the agent loop with the given prompt
-            # 3. Capture the response
-            # 4. Update the job record with the result
-            #
-            # The plugin's register() function has access to the
-            # PluginContext which can invoke agent.run() or delegate_task.
-            #
-            # For now, simulate a quick response:
-            response = f"Job {record.job_id} executed. Prompt: {record.prompt[:100]}"
-            error = ""
-
-            # Update final state
-            _store.update_job(
-                record.job_id,
-                status="done",
-                response=response,
-                error=error,
-                completed_at=time.time(),
-                heartbeat_at=time.time(),
-            )
-
-            if _mirror:
-                try:
-                    _mirror.notify_complete(record.job_id, response, record.telegram_target)
-                except Exception:
-                    pass
-
-        except Exception as e:
-            error = str(e)
-            _store.update_job(
-                record.job_id,
-                status="error",
-                error=error,
-                completed_at=time.time(),
-            )
-            logger.error("Background job %s failed: %s", record.job_id, e)
-            if _mirror:
-                try:
-                    _mirror.notify_error(record.job_id, error, record.telegram_target)
-                except Exception:
-                    pass
-        finally:
-            # Clean up cancel token
-            with _lock:
-                _cancel_tokens.pop(record.job_id, None)
-
-    t = threading.Thread(target=_run, daemon=True, name=f"cgb-job-{record.job_id}")
+    # 4. Launch background thread (non-blocking, <1s)
+    t = threading.Thread(
+        target=_start_background_job,
+        args=(record, cancel_evt),
+        daemon=True,
+        name=f"cgpt-job-{job_id}",
+    )
     t.start()
 
+    return json.dumps({
+        "job_id": job_id,
+        "status": "queued",
+        "prompt_preview": prompt[:200],
+    })
 
-# ===========================================================================
-# Tool: chatgpt_agent_status
-# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Background job runner
+# ---------------------------------------------------------------------------
+
+def _start_background_job(record, cancel_event: threading.Event) -> None:
+    """Background thread: set status=running, run agent, set status=done/error/cancelled."""
+    if _store is None:
+        return
+
+    job_id = record.job_id
+    logger.info("Background job %s starting", job_id)
+
+    try:
+        # Check if already cancelled before starting
+        if cancel_event.is_set():
+            _store.update_job(job_id, status="cancelled", completed_at=time.time())
+            if _mirror is not None:
+                _mirror.notify_cancelled(job_id)
+            return
+
+        # Set to running
+        _store.update_job(job_id, status="running", started_at=time.time())
+
+        # Run the actual Hermes Agent
+        result = run_hermes_agent_job(record, cancel_event)
+
+        # Check if cancelled during execution
+        if cancel_event.is_set():
+            _store.update_job(
+                job_id,
+                status="cancelled",
+                completed_at=time.time(),
+                iterations=result.get("iterations", 0),
+                session_id=result.get("session_id", ""),
+            )
+            if _mirror is not None:
+                _mirror.notify_cancelled(job_id)
+            return
+
+        # Success
+        if result["error"]:
+            _store.update_job(
+                job_id,
+                status="error",
+                response="",
+                error=result["error"],
+                iterations=result.get("iterations", 0),
+                session_id=result.get("session_id", ""),
+                completed_at=time.time(),
+            )
+            if _mirror is not None:
+                tg_target = record.telegram_target or ''
+                _mirror.notify_error(job_id, result["error"], tg_target)
+        else:
+            _store.update_job(
+                job_id,
+                status="done",
+                response=result["response"],
+                error="",
+                iterations=result.get("iterations", 0),
+                session_id=result.get("session_id", ""),
+                completed_at=time.time(),
+            )
+            if _mirror is not None:
+                tg_target = record.telegram_target or ''
+                _mirror.notify_complete(job_id, result["response"], tg_target)
+
+    except Exception as exc:
+        logger.exception("Background job %s failed: %s", job_id, exc)
+        _store.update_job(job_id, status="error", error=str(exc), completed_at=time.time())
+        if _mirror is not None:
+            tg_target = record.telegram_target or ''
+            _mirror.notify_error(job_id, str(exc), tg_target)
+
+
+# ---------------------------------------------------------------------------
+# chatgpt_agent_status
+# ---------------------------------------------------------------------------
 
 def chatgpt_agent_status(job_id: str) -> str:
-    """Get the status of a job.
+    """Get status of a job."""
+    if _store is None:
+        return json.dumps({"error": "JobStore not initialized"})
 
-    Args:
-        job_id: The job ID from chatgpt_agent_start.
-
-    Returns:
-        JSON with status, timestamps, iterations, and prompt preview.
-    """
-    _ensure()
     record = _store.get_job(job_id)
-
-    if record is None:
-        return json.dumps({
-            "job_id": job_id,
-            "error": f"Job not found: {job_id}",
-        }, indent=2)
+    if not record:
+        return json.dumps({"error": f"Job {job_id} not found"})
 
     return json.dumps({
         "job_id": record.job_id,
         "status": record.status,
+        "prompt": record.prompt[:200],
         "model": record.model,
-        "prompt_preview": record.prompt[:200],
+        "iterations": record.iterations,
         "created_at": record.created_at,
         "started_at": record.started_at,
         "completed_at": record.completed_at,
-        "iterations": record.iterations,
-        "heartbeat_at": record.heartbeat_at,
-        "mirror_to_telegram": record.mirror_to_telegram,
-        "telegram_target": record.telegram_target,
-    }, indent=2)
+    })
 
 
-# ===========================================================================
-# Tool: chatgpt_agent_result
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# chatgpt_agent_result
+# ---------------------------------------------------------------------------
 
 def chatgpt_agent_result(job_id: str) -> str:
-    """Get the result of a completed job.
+    """Get the result of a completed job."""
+    if _store is None:
+        return json.dumps({"error": "JobStore not initialized"})
 
-    Args:
-        job_id: The job ID from chatgpt_agent_start.
-
-    Returns:
-        JSON with response, error, and job metadata.
-    """
-    _ensure()
     record = _store.get_job(job_id)
-
-    if record is None:
-        return json.dumps({
-            "job_id": job_id,
-            "error": f"Job not found: {job_id}",
-        }, indent=2)
+    if not record:
+        return json.dumps({"error": f"Job {job_id} not found"})
 
     return json.dumps({
         "job_id": record.job_id,
         "status": record.status,
         "response": record.response,
         "error": record.error,
-        "model": record.model,
         "iterations": record.iterations,
+        "session_id": record.session_id,
         "created_at": record.created_at,
-        "started_at": record.started_at,
         "completed_at": record.completed_at,
-    }, indent=2)
+    })
 
 
-# ===========================================================================
-# Tool: chatgpt_agent_cancel
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# chatgpt_agent_cancel
+# ---------------------------------------------------------------------------
 
 def chatgpt_agent_cancel(job_id: str) -> str:
     """Cancel a running job.
 
-    Args:
-        job_id: The job ID to cancel.
+    Sets the cancel event and updates status to 'cancelled'.
+    The background thread checks the cancel event before and after
+    each polling cycle.
 
-    Returns:
-        JSON with result status.
+    For subprocess-based backend, the process is terminated with
+    SIGTERM followed by SIGKILL after a grace period.
     """
-    _ensure()
+    if _store is None:
+        return json.dumps({"error": "JobStore not initialized"})
 
     record = _store.get_job(job_id)
-    if record is None:
-        return json.dumps({
-            "job_id": job_id,
-            "error": f"Job not found: {job_id}",
-        }, indent=2)
+    if not record:
+        return json.dumps({"error": f"Job {job_id} not found"})
 
-    if record.status not in {"queued", "running"}:
+    if record.status not in ("running", "queued"):
         return json.dumps({
             "job_id": job_id,
             "status": record.status,
-            "error": f"Cannot cancel job in status '{record.status}'",
-        }, indent=2)
+            "cancelled": False,
+            "reason": f"Job is already {record.status}, cannot cancel",
+        })
 
-    # Signal cancellation via the cancel token
-    with _lock:
-        cancel_event = _cancel_tokens.get(job_id)
+    # Signal cancellation
+    cancel_evt = _cancel_events.get(job_id)
+    if cancel_evt:
+        cancel_evt.set()
+        # Remove from tracking
+        del _cancel_events[job_id]
 
-    if cancel_event is not None:
-        cancel_event.set()
-
+    # Update status
     _store.update_job(job_id, status="cancelled", completed_at=time.time())
-    logger.info("Job %s cancelled", job_id)
 
     return json.dumps({
         "job_id": job_id,
+        "cancelled": True,
+        "cancellation_supported": True,
         "status": "cancelled",
-        "message": "Job cancelled",
-    }, indent=2)
+    })
 
 
-# ===========================================================================
-# Tool: chatgpt_bridge_status
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# chatgpt_bridge_status
+# ---------------------------------------------------------------------------
 
 def chatgpt_bridge_status(job_id: str = "") -> str:
-    """Get bridge status — either general stats, a specific job, or systemd service status.
+    """Get bridge health, JobStore stats, and systemd service status."""
+    if _store is None:
+        return json.dumps({"error": "JobStore not initialized"})
 
-    Args:
-        job_id: Optional job ID. Empty = general bridge + service status.
+    stats = {}
+    try:
+        all_jobs = _store.list_jobs(limit=100)
+        stats = {"total": len(all_jobs)}
+        for s in ("queued", "running", "done", "error", "cancelled"):
+            stats[s] = sum(1 for j in all_jobs if j.status == s)
+    except Exception:
+        stats = {"total": 0, "error": "failed to count jobs"}
 
-    Returns:
-        JSON with bridge stats, JobStore info, systemd service statuses,
-        local MCP URL, and helpful commands.
-    """
-    _ensure()
+    result: dict = {
+        "bridge": "running",
+        "job_stats": stats,
+        "services": {},
+    }
 
+    # Check systemd services via subprocess
+    for svc in ["chatgpt-mcp-bridge.service", "chatgpt-mcp-cloudflared.service"]:
+        try:
+            out = subprocess.run(
+                ["systemctl", "--user", "is-active", svc],
+                capture_output=True, text=True, timeout=5,
+            )
+            result["services"][svc] = out.stdout.strip()
+        except Exception:
+            result["services"][svc] = "unreachable"
+
+    # If job_id provided, also include job detail
     if job_id:
-        # Specific job status
         record = _store.get_job(job_id)
-        if record is None:
-            return json.dumps({
-                "error": f"Job not found: {job_id}",
-            }, indent=2)
-        return json.dumps({
-            "type": "job",
-            "job_id": record.job_id,
-            "status": record.status,
-            "model": record.model,
-            "prompt_preview": record.prompt[:200],
-            "iterations": record.iterations,
-            "created_at": record.created_at,
-            "started_at": record.started_at,
-            "completed_at": record.completed_at,
-            "mirror_to_telegram": record.mirror_to_telegram,
-            "telegram_target": record.telegram_target,
-        }, indent=2)
-
-    # General bridge + systemd service status
-    all_jobs = _store.list_jobs(limit=1000)
-    status_counts = {}
-    for j in all_jobs:
-        status_counts[j.status] = status_counts.get(j.status, 0) + 1
-
-    # Get systemd service info via the services module
-    service_info = svc.status_services()
-    service_data = json.loads(service_info)
-
-    return json.dumps({
-        "type": "bridge",
-        "plugin": "chatgpt_mcp_bridge",
-        "version": "0.2.0",
-        "total_jobs": len(all_jobs),
-        "status_counts": status_counts,
-        "recent_jobs": [
-            {
-                "job_id": j.job_id,
-                "status": j.status,
-                "prompt_preview": j.prompt[:100],
-                "created_at": j.created_at,
+        if record:
+            result["job"] = {
+                "job_id": record.job_id,
+                "status": record.status,
+                "prompt": record.prompt[:200],
             }
-            for j in all_jobs[:10]
-        ],
-        "systemd_services": {
-            "bridge": service_data.get("bridge_service", {}),
-            "tunnel": service_data.get("tunnel_service", {}),
-        },
-        "local_mcp_url": service_data.get("local_mcp_url", "http://127.0.0.1:9100/mcp"),
-        "helpful_commands": service_data.get("helpful_commands", []),
-    }, indent=2)
+        else:
+            result["job"] = {"error": f"Job {job_id} not found"}
+
+    return json.dumps(result)
 
 
-# ===========================================================================
-# Tool: chatgpt_bridge_install_services
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Service management tools
+# ---------------------------------------------------------------------------
 
 def chatgpt_bridge_install_services(
     mode: str = "user",
@@ -395,62 +473,48 @@ def chatgpt_bridge_install_services(
     dry_run: bool = False,
     enable: bool = True,
 ) -> str:
-    """Install (or dry-run) systemd user services for the bridge.
+    """Install systemd user services for the bridge and Cloudflare tunnel.
 
-    Generates unit files for:
-      1. chatgpt-mcp-bridge.service — standalone MCP server
-      2. chatgpt-mcp-cloudflared.service — Cloudflare tunnel
-
-    Args:
-        mode: Service mode (only 'user' supported).
-        tunnel_mode: 'quick' or 'named'.
-        host: Bind address.
-        port: Port for MCP server.
-        named_tunnel: Tunnel name (required if tunnel_mode='named').
-        working_dir: Working directory.
-        python_path: Path to python3.
-        cloudflared_path: Path to cloudflared.
-        dry_run: If true, only render unit contents.
-        enable: If true, enable services via systemctl.
-
-    Returns:
-        JSON with ok, unit contents, paths, warnings.
+    Returns a JSON object (not double-encoded).
     """
-    return json.dumps(svc.install_services(
+    if _store is None:
+        return json.dumps({"error": "JobStore not initialized"})
+
+    from . import services as svc
+
+    # Call services module — it returns a Python dict now (Finding 4 fix)
+    result = svc.install_services(
         mode=mode,
         tunnel_mode=tunnel_mode,
         host=host,
         port=port,
-        named_tunnel=named_tunnel if named_tunnel else None,
-        working_dir=working_dir if working_dir else None,
-        python_path=python_path if python_path else None,
-        cloudflared_path=cloudflared_path if cloudflared_path else None,
+        named_tunnel=named_tunnel,
+        working_dir=working_dir,
+        python_path=python_path,
+        cloudflared_path=cloudflared_path,
         dry_run=dry_run,
         enable=enable,
-    ), indent=2)
+    )
+    return json.dumps(result)
 
-
-# ===========================================================================
-# Tool: chatgpt_bridge_start_services
-# ===========================================================================
 
 def chatgpt_bridge_start_services() -> str:
-    """Start both bridge and tunnel systemd user services.
+    """Start both bridge and tunnel systemd user services."""
+    if _store is None:
+        return json.dumps({"error": "JobStore not initialized"})
 
-    Returns:
-        JSON with start results and hint to check tunnel URL via journalctl.
-    """
-    return svc.start_services()
+    from . import services as svc
 
+    result = svc.start_services()
+    return json.dumps(result)
 
-# ===========================================================================
-# Tool: chatgpt_bridge_stop_services
-# ===========================================================================
 
 def chatgpt_bridge_stop_services() -> str:
-    """Stop tunnel first, then bridge systemd user services.
+    """Stop tunnel first, then bridge systemd user services."""
+    if _store is None:
+        return json.dumps({"error": "JobStore not initialized"})
 
-    Returns:
-        JSON with stop results for each service.
-    """
-    return svc.stop_services()
+    from . import services as svc
+
+    result = svc.stop_services()
+    return json.dumps(result)

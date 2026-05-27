@@ -188,73 +188,74 @@ CHATGPT_BRIDGE_STOP_SERVICES_SCHEMA = {
 def register(ctx) -> None:  # noqa: D401
     """Register the chatgpt_mcp_bridge plugin.
 
-    Registers 5 MCP tools with the plugin context so they appear alongside
+    Registers 9 MCP tools with the plugin context so they appear alongside
     built-in tools in the agent's tool registry.
     """
-    from . import tools
+    # Import tools module with alias to avoid conflict with 'tools' parameter name
+    from . import tools as bridge_tools
 
     # Initialize shared state
     from .jobs import JobStore
     from .telegram_mirror import TelegramMirror
 
-    tools._store = JobStore()
-    tools._mirror = TelegramMirror(tools._store)
+    bridge_tools._store = JobStore()
+    bridge_tools._mirror = TelegramMirror(bridge_tools._store, default_target="telegram:528368879")
 
     # Register each tool with the plugin context
     ctx.register_tool(
         name="chatgpt_agent_start",
         toolset="chatgpt_mcp_bridge",
         schema=CHATGPT_AGENT_START_SCHEMA,
-        handler=tools.chatgpt_agent_start,
+        handler=bridge_tools.chatgpt_agent_start,
         description="Start a new ChatGPT → Hermes Agent job. Creates a job and returns job_id immediately.",
     )
     ctx.register_tool(
         name="chatgpt_agent_status",
         toolset="chatgpt_mcp_bridge",
         schema=CHATGPT_AGENT_STATUS_SCHEMA,
-        handler=tools.chatgpt_agent_status,
+        handler=bridge_tools.chatgpt_agent_status,
         description="Get the status of a job (queued/running/done/error/cancelled).",
     )
     ctx.register_tool(
         name="chatgpt_agent_result",
         toolset="chatgpt_mcp_bridge",
         schema=CHATGPT_AGENT_RESULT_SCHEMA,
-        handler=tools.chatgpt_agent_result,
+        handler=bridge_tools.chatgpt_agent_result,
         description="Get the result of a completed job (response/error).",
     )
     ctx.register_tool(
         name="chatgpt_agent_cancel",
         toolset="chatgpt_mcp_bridge",
         schema=CHATGPT_AGENT_CANCEL_SCHEMA,
-        handler=tools.chatgpt_agent_cancel,
+        handler=bridge_tools.chatgpt_agent_cancel,
         description="Cancel a running job.",
     )
     ctx.register_tool(
         name="chatgpt_bridge_status",
         toolset="chatgpt_mcp_bridge",
         schema=CHATGPT_BRIDGE_STATUS_SCHEMA,
-        handler=tools.chatgpt_bridge_status,
+        handler=bridge_tools.chatgpt_bridge_status,
         description="Get bridge status — general stats, job details, or systemd service status.",
     )
     ctx.register_tool(
         name="chatgpt_bridge_install_services",
         toolset="chatgpt_mcp_bridge",
         schema=CHATGPT_BRIDGE_INSTALL_SERVICES_SCHEMA,
-        handler=tools.chatgpt_bridge_install_services,
+        handler=bridge_tools.chatgpt_bridge_install_services,
         description="Install systemd user services for the bridge and Cloudflare tunnel.",
     )
     ctx.register_tool(
         name="chatgpt_bridge_start_services",
         toolset="chatgpt_mcp_bridge",
         schema=CHATGPT_BRIDGE_START_SERVICES_SCHEMA,
-        handler=tools.chatgpt_bridge_start_services,
+        handler=bridge_tools.chatgpt_bridge_start_services,
         description="Start both bridge and tunnel systemd user services.",
     )
     ctx.register_tool(
         name="chatgpt_bridge_stop_services",
         toolset="chatgpt_mcp_bridge",
         schema=CHATGPT_BRIDGE_STOP_SERVICES_SCHEMA,
-        handler=tools.chatgpt_bridge_stop_services,
+        handler=bridge_tools.chatgpt_bridge_stop_services,
         description="Stop tunnel first, then bridge systemd user services.",
     )
 
@@ -293,10 +294,10 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
     # Initialize
     from .jobs import JobStore
     from .telegram_mirror import TelegramMirror
-    from . import tools
+    from . import tools as bridge_tools
 
-    tools._store = JobStore()
-    tools._mirror = TelegramMirror(tools._store)
+    bridge_tools._store = JobStore()
+    bridge_tools._mirror = TelegramMirror(bridge_tools._store, default_target="telegram:528368879")
 
     # Import MCP SDK
     try:
@@ -331,7 +332,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         prompt: str,
         model: str = "",
         max_iterations: int = 50,
-        tools_arg: str = "[]",
+        tools: str = "[]",
         context: str = "",
         rules: str = "",
         system_prompt: str = "",
@@ -347,7 +348,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
             prompt: The user prompt to send to Hermes Agent.
             model: Model to use (empty = default).
             max_iterations: Max tool-use iterations (default 50).
-            tools_arg: JSON array of tool names to enable.
+            tools: JSON array of tool names to enable (e.g. '["web","terminal"]').
             context: Additional context for the agent.
             rules: Additional rules/instructions.
             system_prompt: Override system prompt.
@@ -357,11 +358,11 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         Returns:
             JSON with job_id and status.
         """
-        return tools.chatgpt_agent_start(
+        return bridge_tools.chatgpt_agent_start(
             prompt=prompt,
             model=model,
             max_iterations=max_iterations,
-            tools=tools_arg,
+            tools=tools,
             context=context,
             rules=rules,
             system_prompt=system_prompt,
@@ -379,7 +380,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         Returns:
             JSON with status, timestamps, and job metadata.
         """
-        return tools.chatgpt_agent_status(job_id=job_id)
+        return bridge_tools.chatgpt_agent_status(job_id=job_id)
 
     @mcp.tool()
     def chatgpt_agent_result(job_id: str) -> str:
@@ -391,7 +392,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         Returns:
             JSON with response, error, and job metadata.
         """
-        return tools.chatgpt_agent_result(job_id=job_id)
+        return bridge_tools.chatgpt_agent_result(job_id=job_id)
 
     @mcp.tool()
     def chatgpt_agent_cancel(job_id: str) -> str:
@@ -403,7 +404,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         Returns:
             JSON with cancellation result.
         """
-        return tools.chatgpt_agent_cancel(job_id=job_id)
+        return bridge_tools.chatgpt_agent_cancel(job_id=job_id)
 
     @mcp.tool()
     def chatgpt_bridge_status(job_id: str = "") -> str:
@@ -415,7 +416,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         Returns:
             JSON with bridge stats, service statuses, and helpful commands.
         """
-        return tools.chatgpt_bridge_status(job_id=job_id)
+        return bridge_tools.chatgpt_bridge_status(job_id=job_id)
 
     @mcp.tool()
     def chatgpt_bridge_install_services(
@@ -447,7 +448,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         Returns:
             JSON with ok, unit contents, paths.
         """
-        return tools.chatgpt_bridge_install_services(
+        return bridge_tools.chatgpt_bridge_install_services(
             mode=mode,
             tunnel_mode=tunnel_mode,
             host=host,
@@ -467,7 +468,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         Returns:
             JSON with start results and journalctl hint.
         """
-        return tools.chatgpt_bridge_start_services()
+        return bridge_tools.chatgpt_bridge_start_services()
 
     @mcp.tool()
     def chatgpt_bridge_stop_services() -> str:
@@ -476,7 +477,7 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
         Returns:
             JSON with stop results.
         """
-        return tools.chatgpt_bridge_stop_services()
+        return bridge_tools.chatgpt_bridge_stop_services()
 
     # Start the server (use StreamableHTTP transport for TCP port listening)
     logger.info("Starting chatgpt_mcp_bridge server on %s:%d", args.host, args.port)
@@ -497,4 +498,6 @@ def run_server(host: str = "127.0.0.1", port: int = 9100) -> None:
 # ===========================================================================
 
 if __name__ == "__main__":
+    from .__main__ import main
+    main()
     run_server()

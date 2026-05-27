@@ -1,123 +1,247 @@
 """
 Systemd service management for chatgpt_mcp_bridge.
 
-Generates and manages systemd user unit files for:
-  1. chatgpt-mcp-bridge.service  — standalone MCP server
-  2. chatgpt-mcp-cloudflared.service  — Cloudflare tunnel to the MCP server
+Generates and manages two systemd user services:
+  - chatgpt-mcp-bridge.service   — standalone FastMCP server
+  - chatgpt-mcp-cloudflared.service — Cloudflare tunnel
 
-All operations use user-level systemd (no sudo).
+All functions return Python dicts (not JSON strings) to avoid double-encoding.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
+import re
 import shutil
 import subprocess
-import sys
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
-logger = logging.getLogger("chatgpt_mcp_bridge.services")
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-_SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
-_BRIDGE_UNIT_NAME = "chatgpt-mcp-bridge.service"
-_TUNNEL_UNIT_NAME = "chatgpt-mcp-cloudflared.service"
-_MAX_OUTPUT = 8000  # chars to keep from subprocess output
-
+logger = logging.getLogger("chatgpt_mcp_bridge")
 
 # ---------------------------------------------------------------------------
-# Data classes
+# Validation helpers
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ServiceConfig:
-    """Configuration for systemd service generation."""
-    mode: str = "user"
-    tunnel_mode: str = "quick"
-    host: str = "127.0.0.1"
-    port: int = 9100
-    named_tunnel: Optional[str] = None
-    working_dir: Optional[str] = None
-    python_path: Optional[str] = None
-    cloudflared_path: Optional[str] = None
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0"}
+_VALID_TUNNEL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
-    def __post_init__(self) -> None:
-        if self.mode != "user":
-            raise ValueError(
-                f"mode='{self.mode}' is not supported. Only 'user' mode is available."
-            )
-        if self.tunnel_mode not in ("quick", "named"):
-            raise ValueError(
-                f"tunnel_mode='{self.tunnel_mode}' must be 'quick' or 'named'."
-            )
-        if self.tunnel_mode == "named" and not self.named_tunnel:
-            raise ValueError(
-                "named_tunnel is required when tunnel_mode='named'."
-            )
-        if self.python_path is None:
-            self.python_path = shutil.which("python3") or "python3"
-        if self.cloudflared_path is None:
-            self.cloudflared_path = shutil.which("cloudflared") or "cloudflared"
-        if self.working_dir is None:
-            self.working_dir = str(Path.home())
+
+def _validate_host(host: str) -> str | None:
+    """Validate bind address. Returns error string or None."""
+    host = host.strip()
+    if not host:
+        return "host must not be empty"
+    if host not in _ALLOWED_HOSTS:
+        return f"host '{host}' is not allowed. Use one of: {', '.join(sorted(_ALLOWED_HOSTS))}"
+    return None
+
+
+def _validate_port(port: int) -> str | None:
+    """Validate port number. Returns error string or None."""
+    if not isinstance(port, int) or port < 1024 or port > 65535:
+        return f"port must be an integer between 1024 and 65535 (got {port})"
+    return None
+
+
+def _validate_tunnel_mode(mode: str) -> str | None:
+    """Validate tunnel mode. Returns error string or None."""
+    if mode not in ("quick", "named"):
+        return f"tunnel_mode must be 'quick' or 'named' (got '{mode}')"
+    return None
+
+
+def _validate_named_tunnel(named: str, mode: str) -> str | None:
+    """Validate named tunnel name. Returns error string or None."""
+    if mode == "named":
+        if not named or not named.strip():
+            return "named_tunnel is required when tunnel_mode='named'"
+        if not _VALID_TUNNEL_RE.match(named):
+            return f"named_tunnel '{named}' contains invalid characters. Only [A-Za-z0-9_.-] allowed"
+    return None
+
+
+def _validate_path(path: str | None, must_exist: bool = False, must_be_dir: bool = False) -> str | None:
+    """Validate a filesystem path. Returns error string or None."""
+    if path is None or path.strip() == "":
+        return None  # Optional — auto-detect
+    path = path.strip()
+    if not os.path.isabs(path):
+        return f"path must be absolute: '{path}'"
+    # Reject paths with newlines, control chars, or dangerous characters
+    if re.search(r"[\n\r\t\x00]", path):
+        return f"path contains control characters: '{path}'"
+    if must_exist:
+        if not os.path.exists(path):
+            return f"path does not exist: '{path}'"
+        if must_be_dir and not os.path.isdir(path):
+            return f"path is not a directory: '{path}'"
+    return None
+
+
+def _which(name: str) -> str | None:
+    """Wrapper around shutil.which."""
+    return shutil.which(name)
 
 
 # ---------------------------------------------------------------------------
-# Unit file rendering
+# Configuration resolution
 # ---------------------------------------------------------------------------
 
-def render_bridge_unit(cfg: ServiceConfig) -> str:
-    """Render the chatgpt-mcp-bridge.service unit file content."""
+def _resolve_config(
+    mode: str,
+    tunnel_mode: str,
+    host: str,
+    port: int,
+    named_tunnel: str,
+    working_dir: str,
+    python_path: str,
+    cloudflared_path: str,
+) -> tuple[dict, list[str], list[str]]:
+    """Resolve and validate all configuration.
+
+    Returns:
+        (config_dict, warnings_list, errors_list)
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    config: dict = {}
+
+    # Validate host
+    err = _validate_host(host)
+    if err:
+        errors.append(err)
+    config["host"] = host.strip()
+
+    # Validate port
+    err = _validate_port(port)
+    if err:
+        errors.append(err)
+    config["port"] = port
+
+    # Validate tunnel_mode
+    err = _validate_tunnel_mode(tunnel_mode)
+    if err:
+        errors.append(err)
+    config["tunnel_mode"] = tunnel_mode
+
+    # Validate named_tunnel
+    err = _validate_named_tunnel(named_tunnel, tunnel_mode)
+    if err:
+        errors.append(err)
+    config["named_tunnel"] = named_tunnel.strip()
+
+    # Validate working_dir
+    if working_dir and working_dir.strip():
+        err = _validate_path(working_dir.strip(), must_exist=True, must_be_dir=True)
+        if err:
+            errors.append(err)
+        config["working_dir"] = os.path.abspath(working_dir.strip())
+    else:
+        config["working_dir"] = str(Path.home())
+
+    # Resolve python_path
+    if python_path and python_path.strip():
+        err = _validate_path(python_path.strip(), must_exist=True)
+        if err:
+            errors.append(err)
+            config["python_path"] = ""
+        else:
+            config["python_path"] = os.path.abspath(python_path.strip())
+    else:
+        found = _which("python3")
+        if found:
+            config["python_path"] = found
+        else:
+            errors.append("python3 not found in PATH. Set python_path explicitly.")
+            config["python_path"] = ""
+
+    # Resolve cloudflared_path
+    if cloudflared_path and cloudflared_path.strip():
+        err = _validate_path(cloudflared_path.strip(), must_exist=True)
+        if err:
+            errors.append(err)
+            config["cloudflared_path"] = ""
+        else:
+            config["cloudflared_path"] = os.path.abspath(cloudflared_path.strip())
+    else:
+        found = _which("cloudflared")
+        if found:
+            config["cloudflared_path"] = found
+        else:
+            errors.append("cloudflared not found in PATH. Install it or set cloudflared_path explicitly.")
+            config["cloudflared_path"] = ""
+
+    # Warnings for non-standard hosts
+    if config["host"] == "0.0.0.0":
+        warnings.append("host is 0.0.0.0 — server will listen on all interfaces (not recommended)")
+
+    return config, warnings, errors
+
+
+# ---------------------------------------------------------------------------
+# Unit file generation
+# ---------------------------------------------------------------------------
+
+def _render_bridge_unit(config: dict) -> str:
+    """Render the bridge systemd unit file."""
+    home = str(Path.home())
+    plugin_dir = os.path.join(home, ".hermes", "plugins")
+    python = config["python_path"] or "python3"
+    host = config["host"]
+    port = config["port"]
+    workdir = config["working_dir"]
+
     return (
         f"[Unit]\n"
-        f"Description=ChatGPT MCP Bridge — standalone MCP server\n"
+        f"Description=ChatGPT MCP Bridge — standalone FastMCP server\n"
         f"After=network.target\n"
         f"\n"
         f"[Service]\n"
         f"Type=simple\n"
-        f"ExecStart={cfg.python_path} -m chatgpt_mcp_bridge\n"
-        f"WorkingDirectory={cfg.working_dir}\n"
-        f"Environment=CHATGPT_MCP_BRIDGE_HOST={cfg.host}\n"
-        f"Environment=CHATGPT_MCP_BRIDGE_PORT={cfg.port}\n"
-        f"Environment=PYTHONUNBUFFERED=1\n"
-        f"Environment=PYTHONPATH={Path.home()}/.hermes/plugins\n"
+        f"ExecStart={python} -m chatgpt_mcp_bridge --host {host} --port {port}\n"
+        f"WorkingDirectory={workdir}\n"
+        f"Environment=PYTHONPATH={plugin_dir}:{python}\n"
         f"Restart=on-failure\n"
         f"RestartSec=5\n"
+        f"StandardOutput=journal\n"
+        f"StandardError=journal\n"
         f"\n"
         f"[Install]\n"
         f"WantedBy=default.target\n"
     )
 
 
-def render_cloudflared_unit(cfg: ServiceConfig) -> str:
-    """Render the chatgpt-mcp-cloudflared.service unit file content."""
-    if cfg.tunnel_mode == "quick":
-        tunnel_args = f"--url http://{cfg.host}:{cfg.port}"
-        description = "ChatGPT MCP Bridge — Cloudflare Quick Tunnel"
+def _render_cloudflared_unit(config: dict) -> str:
+    """Render the Cloudflare tunnel systemd unit file."""
+    home = str(Path.home())
+    cloudflared = config["cloudflared_path"] or "cloudflared"
+    host = config["host"]
+    port = config["port"]
+    workdir = config["working_dir"]
+    tunnel_mode = config["tunnel_mode"]
+    named = config["named_tunnel"]
+
+    if tunnel_mode == "quick":
+        tunnel_arg = "quick-tunnel"
     else:
-        tunnel_args = f"run {cfg.named_tunnel}"
-        description = f"ChatGPT MCP Bridge — Cloudflare Named Tunnel ({cfg.named_tunnel})"
+        tunnel_arg = f"tunnel --url http://{host}:{port}"
 
     return (
         f"[Unit]\n"
-        f"Description={description}\n"
-        f"After=network.target chatgpt-mcp-bridge.service\n"
+        f"Description=ChatGPT MCP Bridge — Cloudflare tunnel\n"
+        f"After=network.target\n"
         f"Requires=chatgpt-mcp-bridge.service\n"
         f"\n"
         f"[Service]\n"
         f"Type=simple\n"
-        f"ExecStart={cfg.cloudflared_path} tunnel {tunnel_args}\n"
-        f"WorkingDirectory={cfg.working_dir}\n"
-        f"Environment=PYTHONUNBUFFERED=1\n"
+        f"ExecStart={cloudflared} {tunnel_arg}\n"
+        f"WorkingDirectory={workdir}\n"
         f"Restart=on-failure\n"
         f"RestartSec=5\n"
+        f"StandardOutput=journal\n"
+        f"StandardError=journal\n"
         f"\n"
         f"[Install]\n"
         f"WantedBy=default.target\n"
@@ -125,93 +249,41 @@ def render_cloudflared_unit(cfg: ServiceConfig) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Service operations
+# Public API — all return Python dicts
 # ---------------------------------------------------------------------------
-
-def _run_sysctl(args: List[str]) -> Dict[str, Any]:
-    """Run a systemctl --user command and return structured result.
-
-    Args:
-        args: Arguments to pass after 'systemctl --user'.
-
-    Returns:
-        Dict with success, exit_code, stdout, stderr.
-    """
-    cmd = ["systemctl", "--user"] + args
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        stdout = result.stdout[-_MAX_OUTPUT:] if result.stdout else ""
-        stderr = result.stderr[-_MAX_OUTPUT:] if result.stderr else ""
-        return {
-            "success": result.returncode == 0,
-            "exit_code": result.returncode,
-            "stdout": stdout.strip(),
-            "stderr": stderr.strip(),
-        }
-    except FileNotFoundError:
-        return {
-            "success": False,
-            "exit_code": 127,
-            "stdout": "",
-            "stderr": "systemctl not found",
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": "systemctl command timed out",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": str(e),
-        }
-
-
-def _is_active(service_name: str) -> bool:
-    """Check if a user service is currently active."""
-    result = _run_sysctl(["is-active", service_name])
-    return result.get("stdout") == "active"
-
 
 def install_services(
     mode: str = "user",
     tunnel_mode: str = "quick",
     host: str = "127.0.0.1",
     port: int = 9100,
-    named_tunnel: Optional[str] = None,
-    working_dir: Optional[str] = None,
-    python_path: Optional[str] = None,
-    cloudflared_path: Optional[str] = None,
+    named_tunnel: str = "",
+    working_dir: str = "",
+    python_path: str = "",
+    cloudflared_path: str = "",
     dry_run: bool = False,
     enable: bool = True,
-) -> str:
-    """Install (or dry-run) systemd user services for the bridge.
+) -> dict:
+    """Install systemd user services for the bridge and Cloudflare tunnel.
 
-    Args:
-        mode: Service mode — only 'user' supported.
-        tunnel_mode: 'quick' or 'named'.
-        host: Bind address for the MCP server.
-        port: Port for the MCP server.
-        named_tunnel: Tunnel name (required if tunnel_mode='named').
-        working_dir: Working directory for services.
-        python_path: Path to python3 binary.
-        cloudflared_path: Path to cloudflared binary.
-        dry_run: If true, only render and return unit contents.
-        enable: If true, systemctl --user enable both services.
-
-    Returns:
-        JSON result string.
+    Returns a dict with:
+        ok, ready, dry_run, warnings, errors,
+        bridge_unit, cloudflared_unit, paths,
+        daemon_reload, enable_results
     """
-    cfg = ServiceConfig(
+    result: dict = {
+        "ok": False,
+        "ready": False,
+        "dry_run": dry_run,
+        "warnings": [],
+        "errors": [],
+        "paths": {},
+        "daemon_reload": False,
+        "enable_results": [],
+    }
+
+    # Validate and resolve config
+    config, warnings, errors = _resolve_config(
         mode=mode,
         tunnel_mode=tunnel_mode,
         host=host,
@@ -222,244 +294,254 @@ def install_services(
         cloudflared_path=cloudflared_path,
     )
 
-    bridge_unit = render_bridge_unit(cfg)
-    tunnel_unit = render_cloudflared_unit(cfg)
+    result["warnings"] = warnings
+    result["errors"] = errors
 
-    bridge_path = _SYSTEMD_USER_DIR / _BRIDGE_UNIT_NAME
-    tunnel_path = _SYSTEMD_USER_DIR / _TUNNEL_UNIT_NAME
+    # If there are errors (missing binaries, invalid config), return immediately
+    if errors:
+        result["ready"] = False
+        result["ok"] = False
+        return result
 
-    warnings: List[str] = []
+    # Render unit files
+    bridge_unit = _render_bridge_unit(config)
+    cloudflared_unit = _render_cloudflared_unit(config)
 
-    # Check prerequisites
-    if not shutil.which(cfg.python_path):
-        warnings.append(
-            f"python3 not found at '{cfg.python_path}'. "
-            f"Install python3 or specify python_path."
-        )
-    if not shutil.which(cfg.cloudflared_path):
-        warnings.append(
-            f"cloudflared not found at '{cfg.cloudflared_path}'. "
-            f"Install cloudflared or specify cloudflared_path."
-        )
+    result["bridge_unit"] = bridge_unit
+    result["cloudflared_unit"] = cloudflared_unit
 
     if dry_run:
-        return json.dumps({
-            "ok": True,
-            "dry_run": True,
-            "bridge_unit": bridge_unit,
-            "cloudflared_unit": tunnel_unit,
-            "paths": {
-                "bridge": str(bridge_path),
-                "cloudflared": str(tunnel_path),
-            },
-            "config": {
-                "mode": cfg.mode,
-                "tunnel_mode": cfg.tunnel_mode,
-                "host": cfg.host,
-                "port": cfg.port,
-                "named_tunnel": cfg.named_tunnel,
-                "python_path": cfg.python_path,
-                "cloudflared_path": cfg.cloudflared_path,
-            },
-            "warnings": warnings,
-        }, indent=2)
+        result["ready"] = True
+        result["ok"] = True
+        return result
 
     # Write unit files
-    if not warnings:
-        try:
-            _SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
-            bridge_path.write_text(bridge_unit)
-            tunnel_path.write_text(tunnel_unit)
-        except OSError as e:
-            return json.dumps({
-                "ok": False,
-                "error": f"Failed to write unit files: {e}",
-                "bridge_unit": bridge_unit,
-                "cloudflared_unit": tunnel_unit,
-            }, indent=2)
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+
+    bridge_path = unit_dir / "chatgpt-mcp-bridge.service"
+    cloudflared_path = unit_dir / "chatgpt-mcp-cloudflared.service"
+
+    try:
+        bridge_path.write_text(bridge_unit)
+        result["paths"]["bridge"] = str(bridge_path)
+    except Exception as exc:
+        errors.append(f"Failed to write bridge unit: {exc}")
+        result["errors"] = errors
+        result["ok"] = False
+        return result
+
+    try:
+        cloudflared_path.write_text(cloudflared_unit)
+        result["paths"]["cloudflared"] = str(cloudflared_path)
+    except Exception as exc:
+        errors.append(f"Failed to write cloudflared unit: {exc}")
+        result["errors"] = errors
+        result["ok"] = False
+        return result
 
     # Daemon reload
-    daemon_result = _run_sysctl(["daemon-reload"])
-    if not daemon_result["success"]:
-        warnings.append(
-            f"daemon-reload failed: {daemon_result['stderr']}"
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            capture_output=True, text=True, timeout=10,
         )
+        result["daemon_reload"] = True
+    except Exception as exc:
+        errors.append(f"daemon-reload failed: {exc}")
 
-    enable_results = []
-    if enable:
-        for svc in [_BRIDGE_UNIT_NAME, _TUNNEL_UNIT_NAME]:
-            er = _run_sysctl(["enable", svc])
-            enable_results.append({
-                "service": svc,
-                "success": er["success"],
-                "exit_code": er["exit_code"],
-                "stdout": er["stdout"],
-                "stderr": er["stderr"],
+    # Enable services
+    for svc_name in ["chatgpt-mcp-bridge.service", "chatgpt-mcp-cloudflared.service"]:
+        try:
+            out = subprocess.run(
+                ["systemctl", "--user", "enable", svc_name],
+                capture_output=True, text=True, timeout=10,
+            )
+            result["enable_results"].append({
+                "service": svc_name,
+                "success": out.returncode == 0,
+                "error": out.stderr.strip() if out.returncode != 0 else "",
             })
-            if not er["success"]:
-                warnings.append(
-                    f"enable {svc} failed: {er['stderr']}"
-                )
+        except Exception as exc:
+            result["enable_results"].append({
+                "service": svc_name,
+                "success": False,
+                "error": str(exc),
+            })
 
-    return json.dumps({
-        "ok": True,
-        "dry_run": False,
-        "paths": {
-            "bridge": str(bridge_path),
-            "cloudflared": str(tunnel_path),
-        },
-        "daemon_reload": daemon_result,
-        "enable_results": enable_results,
-        "warnings": warnings,
-    }, indent=2)
+    # Overall ok = all enables succeeded
+    all_enabled = all(r["success"] for r in result["enable_results"])
+    result["ok"] = all_enabled and not errors
+    result["ready"] = True
+
+    return result
 
 
-def start_services() -> str:
+def start_services() -> dict:
     """Start both bridge and tunnel systemd user services.
 
-    Returns:
-        JSON with start results for each service.
+    Returns dict with service statuses and hint.
     """
-    bridge_result = _run_sysctl(["start", _BRIDGE_UNIT_NAME])
-    tunnel_result = _run_sysctl(["start", _TUNNEL_UNIT_NAME])
+    result: dict = {}
+    errors: list[str] = []
 
-    # Give the bridge a moment to bind before starting tunnel
-    if bridge_result["success"]:
-        import time
-        time.sleep(1)
-        # Restart tunnel in case bridge wasn't ready
-        tunnel_result = _run_sysctl(["restart", _TUNNEL_UNIT_NAME])
+    for svc in ["chatgpt-mcp-bridge.service", "chatgpt-mcp-cloudflared.service"]:
+        try:
+            out = subprocess.run(
+                ["systemctl", "--user", "start", svc],
+                capture_output=True, text=True, timeout=15,
+            )
+            result[svc] = {
+                "success": out.returncode == 0,
+                "error": out.stderr.strip() if out.returncode != 0 else "",
+                "exit_code": out.returncode,
+            }
+        except Exception as exc:
+            result[svc] = {
+                "success": False,
+                "error": str(exc),
+                "exit_code": -1,
+            }
+            errors.append(f"{svc}: {exc}")
 
-    return json.dumps({
-        "bridge": bridge_result,
-        "tunnel": tunnel_result,
-        "hint": (
-            "To see the Quick Tunnel URL, run:\n"
-            "  journalctl --user -u chatgpt-mcp-cloudflared.service -f"
-        ),
-    }, indent=2)
+    if errors:
+        result["error"] = "; ".join(errors)
+
+    result["hint"] = (
+        "View logs:\n"
+        "  journalctl --user -u chatgpt-mcp-bridge.service -f\n"
+        "  journalctl --user -u chatgpt-mcp-cloudflared.service -f\n"
+        "Tunnel URL:\n"
+        "  journalctl --user -u chatgpt-mcp-cloudflared.service -n 50 | grep trycloudflare.com"
+    )
+
+    return result
 
 
-def stop_services() -> str:
+def stop_services() -> dict:
     """Stop tunnel first, then bridge.
 
-    Returns:
-        JSON with stop results for each service.
+    Returns dict with service statuses.
     """
-    tunnel_result = _run_sysctl(["stop", _TUNNEL_UNIT_NAME])
-    bridge_result = _run_sysctl(["stop", _BRIDGE_UNIT_NAME])
+    result: dict = {}
+    errors: list[str] = []
 
-    return json.dumps({
-        "tunnel": tunnel_result,
-        "bridge": bridge_result,
-    }, indent=2)
+    for svc in ["chatgpt-mcp-cloudflared.service", "chatgpt-mcp-bridge.service"]:
+        try:
+            out = subprocess.run(
+                ["systemctl", "--user", "stop", svc],
+                capture_output=True, text=True, timeout=15,
+            )
+            result[svc] = {
+                "success": out.returncode == 0,
+                "error": out.stderr.strip() if out.returncode != 0 else "",
+                "exit_code": out.returncode,
+            }
+        except Exception as exc:
+            result[svc] = {
+                "success": False,
+                "error": str(exc),
+                "exit_code": -1,
+            }
+            errors.append(f"{svc}: {exc}")
+
+    if errors:
+        result["error"] = "; ".join(errors)
+
+    result["hint"] = "Stopped tunnel first, then bridge."
+    return result
 
 
-def _parse_service_status(service_name: str) -> Dict[str, Any]:
-    """Parse systemctl status output to extract PID, memory, etc.
+def status_services() -> dict:
+    """Get status of all managed services.
 
-    Returns:
-        Dict with name, is_active, pid, memory, status_output, error.
+    Returns dict with service statuses.
     """
-    result = _run_sysctl(["status", service_name, "--no-pager"])
-    stdout = result.get("stdout", "")
-    stderr = result.get("stderr", "")
+    result: dict = {}
 
-    is_active = "active (running)" in stdout or "active (" in stdout
+    for svc in ["chatgpt-mcp-bridge.service", "chatgpt-mcp-cloudflared.service"]:
+        status = check_service(svc)
+        result[svc] = {
+            "is_active": status["is_active"],
+            "pid": status.get("pid"),
+            "memory": status.get("memory"),
+            "result": status.get("result"),
+            "error": status.get("error"),
+        }
 
-    pid = "N/A"
-    memory = "N/A"
+    # Also check local MCP endpoint
+    try:
+        check = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "http://127.0.0.1:9100/mcp",
+             "-H", "Content-Type: application/json",
+             "-H", "Accept: application/json, text/event-stream",
+             "-d", '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'],
+            capture_output=True, text=True, timeout=5,
+        )
+        code = check.stdout.strip()
+        result["mcp_endpoint"] = {
+            "url": "http://127.0.0.1:9100/mcp",
+            "http_code": code,
+            "reachable": code == "200",
+        }
+    except Exception as exc:
+        result["mcp_endpoint"] = {
+            "url": "http://127.0.0.1:9100/mcp",
+            "reachable": False,
+            "error": str(exc),
+        }
 
-    if is_active:
-        # Extract PID from "Main PID: 12345 (python3)"
-        for line in stdout.splitlines():
-            if "Main PID:" in line:
-                parts = line.split("Main PID:")[1].strip().split()
-                pid = parts[0] if parts else "N/A"
-                break
-        # Extract memory from "Memory: 44.3M"
-        for line in stdout.splitlines():
-            if "Memory:" in line:
-                memory = line.split("Memory:")[1].strip().split(";")[0].strip()
-                break
-
-    return {
-        "name": service_name,
-        "is_active": is_active,
-        "pid": pid,
-        "memory": memory,
-        "status_output": stdout,
-        "error": stderr,
-    }
+    return result
 
 
-def check_service(service_name: str) -> Dict[str, Any]:
+def check_service(service_name: str) -> dict:
     """Check the status of a single systemd service.
 
-    Args:
-        service_name: Name of the service (e.g. 'chatgpt-mcp-bridge.service').
-
-    Returns:
-        Dict with name, is_active, pid, memory, status_output, error.
+    Returns dict with is_active, pid, memory, result, error.
     """
-    return _parse_service_status(service_name)
+    result: dict = {
+        "name": service_name,
+        "is_active": False,
+        "pid": None,
+        "memory": None,
+        "result": None,
+        "error": None,
+    }
 
+    try:
+        # Get active state
+        out = subprocess.run(
+            ["systemctl", "--user", "is-active", service_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        result["result"] = out.stdout.strip()
+        result["is_active"] = out.stdout.strip() == "active"
 
-def status_services() -> str:
-    """Get status of both services and the bridge.
+        if result["is_active"]:
+            # Get PID
+            out = subprocess.run(
+                ["systemctl", "--user", "show", service_name, "--property=MainPID"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pid_str = out.stdout.strip().split("=")[-1].strip()
+            if pid_str and pid_str != "0":
+                result["pid"] = int(pid_str)
 
-    Returns:
-        JSON with plugin status, JobStore status, service statuses,
-        local MCP URL, and helpful commands.
-    """
-    from .jobs import JobStore
+            # Get memory
+            out = subprocess.run(
+                ["systemctl", "--user", "show", service_name, "--property=MemoryCurrent"],
+                capture_output=True, text=True, timeout=5,
+            )
+            mem_str = out.stdout.strip().split("=")[-1].strip()
+            if mem_str and mem_str != "0":
+                mem_bytes = int(mem_str)
+                if mem_bytes > 1048576:
+                    result["memory"] = f"{mem_bytes / 1048576:.1f} MB"
+                else:
+                    result["memory"] = f"{mem_bytes / 1024:.1f} KB"
 
-    store = JobStore()
-    all_jobs = store.list_jobs(limit=1000)
-    status_counts = {}
-    for j in all_jobs:
-        status_counts[j.status] = status_counts.get(j.status, 0) + 1
+    except Exception as exc:
+        result["error"] = str(exc)
 
-    # Service statuses
-    bridge_active = _is_active(_BRIDGE_UNIT_NAME)
-    tunnel_active = _is_active(_TUNNEL_UNIT_NAME)
-
-    bridge_status_raw = _run_sysctl([
-        "status", _BRIDGE_UNIT_NAME, "--no-pager"
-    ])
-    tunnel_status_raw = _run_sysctl([
-        "status", _TUNNEL_UNIT_NAME, "--no-pager"
-    ])
-
-    local_mcp_url = f"http://127.0.0.1:9100/mcp"
-
-    return json.dumps({
-        "type": "bridge",
-        "plugin": "chatgpt_mcp_bridge",
-        "version": "0.2.0",
-        "local_mcp_url": local_mcp_url,
-        "job_store": {
-            "total_jobs": len(all_jobs),
-            "status_counts": status_counts,
-        },
-        "bridge_service": {
-            "name": _BRIDGE_UNIT_NAME,
-            "is_active": bridge_active,
-            "status_output": bridge_status_raw.get("stdout", ""),
-            "error": bridge_status_raw.get("stderr", ""),
-        },
-        "tunnel_service": {
-            "name": _TUNNEL_UNIT_NAME,
-            "is_active": tunnel_active,
-            "status_output": tunnel_status_raw.get("stdout", ""),
-            "error": tunnel_status_raw.get("stderr", ""),
-        },
-        "helpful_commands": [
-            f"systemctl --user start {_BRIDGE_UNIT_NAME}",
-            f"systemctl --user start {_TUNNEL_UNIT_NAME}",
-            f"systemctl --user stop {_TUNNEL_UNIT_NAME}",
-            f"systemctl --user stop {_BRIDGE_UNIT_NAME}",
-            f"journalctl --user -u {_BRIDGE_UNIT_NAME} -f",
-            f"journalctl --user -u {_TUNNEL_UNIT_NAME} -f",
-        ],
-    }, indent=2)
+    return result

@@ -1,5 +1,5 @@
 name: chatgpt_mcp_bridge
-version: 0.1.0
-description: "Async MCP interface for ChatGPT Web to Hermes Agent — standalone MCP server with job management, Telegram mirror, and persistent state."
+version: 0.3.0
+description: "Async MCP interface for ChatGPT Web → Hermes Agent. Provides 9 tools for agent job dispatch, monitoring, cancellation, and systemd service management."
 kind: backend
 entrypoint: "chatgpt_mcp_bridge:register"
